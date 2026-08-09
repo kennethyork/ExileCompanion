@@ -2947,112 +2947,165 @@ impl CompanionApp {
     }
 
     fn tools(&mut self, ui: &mut egui::Ui) {
-        section_intro(
-            ui,
-            "Local competitive toolkit",
-            "Planning and analysis stay on this machine. Inputs are captured or entered by you, and estimates are labelled.",
-        );
-        ui.columns(2, |columns| {
-            planner_frame(&mut columns[0], "MAP MOD RISK CHECK", |ui| {
-                ui.label("One risk phrase per line");
-                ui.add(
-                    egui::TextEdit::multiline(&mut self.map_risk_rules)
-                        .desired_rows(4)
-                        .desired_width(f32::INFINITY),
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                section_intro(
+                    ui,
+                    "Local competitive toolkit",
+                    "Planning and analysis stay on this machine. Inputs are captured or entered by you, and estimates are labelled.",
                 );
-                ui.label("Paste map modifiers");
-                ui.add(
-                    egui::TextEdit::multiline(&mut self.map_mod_input)
-                        .desired_rows(5)
-                        .desired_width(f32::INFINITY),
-                );
-                ui.horizontal(|ui| {
-                    if ui
-                        .add_enabled(
-                            self.ocr_receiver.is_none(),
-                            egui::Button::new("Capture map mods"),
-                        )
-                        .clicked()
-                    {
-                        self.capture_map_mod_screen(ui.ctx());
-                    }
-                    if ui.button("Check risks").clicked() {
-                        self.analyze_map_mods();
-                    }
-                    if ui.button("Save rules").clicked() {
-                        let value = self.map_risk_rules.clone();
-                        self.save_planner_text("planner.map_risks", &value);
-                    }
-                });
-                ui.label(RichText::new(&self.map_mod_status).color(
-                    if self.map_mod_status.starts_with("DANGER") {
-                        DANGER
-                    } else {
-                        TEXT_MUTED
-                    },
-                ));
+
+                if ui.available_width() >= 820.0 {
+                    ui.columns(2, |columns| {
+                        self.map_mod_tool(&mut columns[0]);
+                        self.crafting_tool(&mut columns[1]);
+                    });
+                } else {
+                    self.map_mod_tool(ui);
+                    ui.add_space(14.0);
+                    self.crafting_tool(ui);
+                }
+
+                ui.add_space(14.0);
+                if ui.available_width() >= 820.0 {
+                    ui.columns(2, |columns| {
+                        self.map_journal_tool(&mut columns[0]);
+                        self.progression_tool(&mut columns[1]);
+                    });
+                } else {
+                    self.map_journal_tool(ui);
+                    ui.add_space(14.0);
+                    self.progression_tool(ui);
+                }
+
+                ui.add_space(14.0);
+                self.loot_filter_tool(ui);
+                ui.add_space(18.0);
             });
-            planner_frame(&mut columns[1], "CRAFTING PLANNER", |ui| {
-                ui.label("Paste copied item text for a transparent local summary.");
-                ui.add(
-                    egui::TextEdit::multiline(&mut self.crafting_input)
-                        .desired_rows(6)
-                        .desired_width(f32::INFINITY),
-                );
-                ui.horizontal(|ui| {
-                    if ui.button("Read clipboard").clicked() {
-                        if let Ok(text) =
-                            arboard::Clipboard::new().and_then(|mut clipboard| clipboard.get_text())
-                        {
-                            self.crafting_input = text;
+    }
+
+    fn map_mod_tool(&mut self, ui: &mut egui::Ui) {
+        planner_frame(ui, "MAP MOD RISK CHECK", |ui| {
+            ui.label("One danger phrase per line");
+            ui.add(
+                egui::TextEdit::multiline(&mut self.map_risk_rules)
+                    .desired_rows(4)
+                    .desired_width(f32::INFINITY),
+            );
+            ui.label("Paste modifiers or capture the visible map panel");
+            ui.add(
+                egui::TextEdit::multiline(&mut self.map_mod_input)
+                    .desired_rows(5)
+                    .desired_width(f32::INFINITY),
+            );
+            ui.horizontal_wrapped(|ui| {
+                if ui
+                    .add_enabled(
+                        self.ocr_receiver.is_none(),
+                        egui::Button::new("Capture map mods"),
+                    )
+                    .on_hover_text(
+                        "Minimizes the app, captures the top-center panel, and runs local OCR",
+                    )
+                    .clicked()
+                {
+                    self.capture_map_mod_screen(ui.ctx());
+                }
+                if ui.button("Check risks").clicked() {
+                    self.analyze_map_mods();
+                }
+                if ui.button("Save rules").clicked() {
+                    let value = self.map_risk_rules.clone();
+                    self.save_planner_text("planner.map_risks", &value);
+                    self.map_mod_status = "Danger phrases saved locally".into();
+                }
+            });
+            ui.label(RichText::new(&self.map_mod_status).color(
+                if self.map_mod_status.starts_with("DANGER") {
+                    DANGER
+                } else {
+                    TEXT_MUTED
+                },
+            ));
+        });
+    }
+
+    fn crafting_tool(&mut self, ui: &mut egui::Ui) {
+        planner_frame(ui, "CRAFTING PLANNER", |ui| {
+            ui.label("Paste copied item text for a transparent local summary.");
+            ui.add(
+                egui::TextEdit::multiline(&mut self.crafting_input)
+                    .hint_text("Ctrl+C an item in Path of Exile, then read the clipboard…")
+                    .desired_rows(6)
+                    .desired_width(f32::INFINITY),
+            );
+            ui.horizontal_wrapped(|ui| {
+                if ui.button("Read clipboard").clicked() {
+                    match arboard::Clipboard::new().and_then(|mut clipboard| clipboard.get_text()) {
+                        Ok(text) => self.crafting_input = text,
+                        Err(error) => {
+                            self.crafting_plan = format!("Could not read clipboard: {error}")
                         }
                     }
-                    if ui.button("Analyze item").clicked() {
-                        self.analyze_crafting_item();
-                    }
-                });
-                ui.add(
-                    egui::TextEdit::multiline(&mut self.crafting_plan)
-                        .hint_text("Your local craft plan and notes…")
-                        .desired_rows(6)
-                        .desired_width(f32::INFINITY),
-                );
+                }
+                if ui.button("Analyze item").clicked() {
+                    self.analyze_crafting_item();
+                }
                 if ui.button("Save plan").clicked() {
                     let value = self.crafting_plan.clone();
                     self.save_planner_text("planner.crafting", &value);
                 }
             });
+            ui.add(
+                egui::TextEdit::multiline(&mut self.crafting_plan)
+                    .hint_text("Analysis, craft plan, and local notes…")
+                    .desired_rows(7)
+                    .desired_width(f32::INFINITY),
+            );
         });
-        ui.add_space(14.0);
-        ui.columns(2, |columns| {
-            planner_frame(&mut columns[0], "MAP RUN JOURNAL", |ui| {
-                ui.label(format!(
-                    "Current area: {}",
-                    if self.current_area.is_empty() {
-                        "unknown"
-                    } else {
-                        &self.current_area
+    }
+
+    fn map_journal_tool(&mut self, ui: &mut egui::Ui) {
+        planner_frame(ui, "MAP RUN JOURNAL", |ui| {
+            ui.label(format!(
+                "Current area: {}",
+                if self.current_area.is_empty() {
+                    "unknown"
+                } else {
+                    &self.current_area
+                }
+            ));
+            ui.horizontal_wrapped(|ui| {
+                if let Some(started) = self.active_map_started {
+                    ui.label(format!("Running {}", format_duration(started.elapsed())));
+                    if ui.button("Finish and save").clicked() {
+                        self.finish_map_run();
                     }
-                ));
-                ui.horizontal(|ui| {
-                    if let Some(started) = self.active_map_started {
-                        ui.label(format!("Running {}", format_duration(started.elapsed())));
-                        if ui.button("Finish and save").clicked() {
-                            self.finish_map_run();
-                        }
-                    } else if ui.button("Start run").clicked() {
-                        self.start_map_run();
-                    }
-                });
-                ui.horizontal(|ui| {
+                } else if ui.button("Start run").clicked() {
+                    self.start_map_run();
+                }
+            });
+            egui::Grid::new("map_run_inputs")
+                .num_columns(2)
+                .show(ui, |ui| {
                     ui.label("Investment");
-                    ui.text_edit_singleline(&mut self.map_investment);
-                });
-                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.map_investment)
+                            .desired_width(f32::INFINITY),
+                    );
+                    ui.end_row();
                     ui.label("Loot/value");
-                    ui.text_edit_singleline(&mut self.map_loot);
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.map_loot).desired_width(f32::INFINITY),
+                    );
+                    ui.end_row();
                 });
-                ui.separator();
+            ui.separator();
+            if self.map_runs.is_empty() {
+                ui.label(RichText::new("No completed map runs yet").color(TEXT_MUTED));
+            } else {
                 for run in self.map_runs.iter().take(6) {
                     ui.label(format!(
                         "{} · {} · {} deaths · in {} · out {}",
@@ -3063,26 +3116,31 @@ impl CompanionApp {
                         run.loot
                     ));
                 }
-            });
-            planner_frame(&mut columns[1], "PROGRESSION CHECKLIST", |ui| {
-                for (complete, label) in progression_checklist(&self.offline_character) {
-                    ui.colored_label(
-                        if complete { SUCCESS } else { GOLD },
-                        format!("{} {label}", if complete { "DONE" } else { "TODO" }),
-                    );
-                }
-                ui.separator();
-                let assessment = assess_character(&self.offline_character);
-                for warning in assessment
-                    .resistance_gaps
-                    .iter()
-                    .chain(assessment.warnings.iter())
-                {
-                    ui.label(RichText::new(warning).size(11.0).color(TEXT_MUTED));
-                }
-            });
+            }
         });
-        ui.add_space(14.0);
+    }
+
+    fn progression_tool(&mut self, ui: &mut egui::Ui) {
+        planner_frame(ui, "PROGRESSION CHECKLIST", |ui| {
+            for (complete, label) in progression_checklist(&self.offline_character) {
+                ui.colored_label(
+                    if complete { SUCCESS } else { GOLD },
+                    format!("{} {label}", if complete { "DONE" } else { "TODO" }),
+                );
+            }
+            ui.separator();
+            let assessment = assess_character(&self.offline_character);
+            for warning in assessment
+                .resistance_gaps
+                .iter()
+                .chain(assessment.warnings.iter())
+            {
+                ui.label(RichText::new(warning).size(11.0).color(TEXT_MUTED));
+            }
+        });
+    }
+
+    fn loot_filter_tool(&mut self, ui: &mut egui::Ui) {
         planner_frame(ui, "LOCAL LOOT FILTER EDITOR", |ui| {
             ui.add(
                 egui::TextEdit::multiline(&mut self.loot_filter_text)
@@ -3090,7 +3148,7 @@ impl CompanionApp {
                     .desired_rows(12)
                     .desired_width(f32::INFINITY),
             );
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 if ui.button("Validate locally").clicked() {
                     self.validate_loot_filter();
                 }
