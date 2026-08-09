@@ -23,7 +23,7 @@ A native Windows/Linux Path of Exile companion written in Rust. The project is i
 - Persistent HUD opacity, size, lock state, and last screen position stored in SQLite
 - Responsive navigation, cards, and spacing for narrow in-game layouts
 - Borderless transparent in-game window with a custom drag region
-- Native transparency enabled at window creation and custom borderless resize grip
+- Native transparency with invisible resize zones on every HUD edge and corner
 - Translucent glass text surfaces prevent game and companion labels from visually colliding
 - Explicit interactive hit surface prevents compositor click-through in the in-game HUD
 - Area, level-up, death, trade-whisper, and chat event parsing

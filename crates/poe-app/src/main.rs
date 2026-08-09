@@ -2861,7 +2861,7 @@ impl eframe::App for CompanionApp {
         if self.overlay_mode && self.compact_mode {
             self.overlay(ctx);
             if !self.hud_locked {
-                resize_grip(ctx);
+                window_resize_edges(ctx);
             }
             return;
         }
@@ -2900,10 +2900,6 @@ impl eframe::App for CompanionApp {
                 Page::Tools => self.tools(ui),
                 Page::Settings => self.settings(ui),
             });
-        if self.overlay_mode {
-            window_drag_handle(ctx);
-            resize_grip(ctx);
-        }
     }
 }
 
@@ -3081,46 +3077,100 @@ fn default_screenshot_folder() -> Option<PathBuf> {
     .find(|path| path.is_dir())
 }
 
-fn resize_grip(ctx: &egui::Context) {
-    egui::Area::new(egui::Id::new("window_resize_grip"))
-        .anchor(egui::Align2::RIGHT_BOTTOM, egui::vec2(-8.0, -8.0))
-        .order(egui::Order::Foreground)
-        .show(ctx, |ui| {
-            let grip = ui
-                .add_sized(
-                    [92.0, 30.0],
-                    egui::Button::new(RichText::new("RESIZE  ↘").size(12.0).color(GOLD))
-                        .fill(Color32::from_rgba_premultiplied(25, 22, 18, 235))
-                        .stroke(Stroke::new(1.0_f32, GOLD_DIM))
-                        .sense(egui::Sense::click_and_drag()),
-                )
-                .on_hover_cursor(egui::CursorIcon::ResizeNwSe)
-                .on_hover_text("Drag to resize");
-            if grip.hovered() && ui.input(|input| input.pointer.primary_pressed()) {
-                ctx.send_viewport_cmd(egui::ViewportCommand::BeginResize(
-                    egui::ResizeDirection::SouthEast,
-                ));
-            }
-        });
+fn window_resize_edges(ctx: &egui::Context) {
+    let size = ctx.input(|input| {
+        input
+            .viewport()
+            .inner_rect
+            .map_or(egui::vec2(460.0, 420.0), |rect| rect.size())
+    });
+    let edge = 6.0;
+    let corner = 14.0;
+    resize_zone(
+        ctx,
+        "resize_north",
+        egui::pos2(corner, 0.0),
+        egui::vec2((size.x - corner * 2.0).max(1.0), edge),
+        egui::ResizeDirection::North,
+        egui::CursorIcon::ResizeVertical,
+    );
+    resize_zone(
+        ctx,
+        "resize_south",
+        egui::pos2(corner, size.y - edge),
+        egui::vec2((size.x - corner * 2.0).max(1.0), edge),
+        egui::ResizeDirection::South,
+        egui::CursorIcon::ResizeVertical,
+    );
+    resize_zone(
+        ctx,
+        "resize_west",
+        egui::pos2(0.0, corner),
+        egui::vec2(edge, (size.y - corner * 2.0).max(1.0)),
+        egui::ResizeDirection::West,
+        egui::CursorIcon::ResizeHorizontal,
+    );
+    resize_zone(
+        ctx,
+        "resize_east",
+        egui::pos2(size.x - edge, corner),
+        egui::vec2(edge, (size.y - corner * 2.0).max(1.0)),
+        egui::ResizeDirection::East,
+        egui::CursorIcon::ResizeHorizontal,
+    );
+    for (id, position, direction, cursor) in [
+        (
+            "resize_north_west",
+            egui::pos2(0.0, 0.0),
+            egui::ResizeDirection::NorthWest,
+            egui::CursorIcon::ResizeNwSe,
+        ),
+        (
+            "resize_north_east",
+            egui::pos2(size.x - corner, 0.0),
+            egui::ResizeDirection::NorthEast,
+            egui::CursorIcon::ResizeNeSw,
+        ),
+        (
+            "resize_south_west",
+            egui::pos2(0.0, size.y - corner),
+            egui::ResizeDirection::SouthWest,
+            egui::CursorIcon::ResizeNeSw,
+        ),
+        (
+            "resize_south_east",
+            egui::pos2(size.x - corner, size.y - corner),
+            egui::ResizeDirection::SouthEast,
+            egui::CursorIcon::ResizeNwSe,
+        ),
+    ] {
+        resize_zone(
+            ctx,
+            id,
+            position,
+            egui::vec2(corner, corner),
+            direction,
+            cursor,
+        );
+    }
 }
 
-fn window_drag_handle(ctx: &egui::Context) {
-    egui::Area::new(egui::Id::new("persistent_window_drag_handle"))
-        .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, 7.0))
+fn resize_zone(
+    ctx: &egui::Context,
+    id: &'static str,
+    position: egui::Pos2,
+    size: egui::Vec2,
+    direction: egui::ResizeDirection,
+    cursor: egui::CursorIcon,
+) {
+    egui::Area::new(egui::Id::new(id))
+        .fixed_pos(position)
         .order(egui::Order::Foreground)
         .show(ctx, |ui| {
-            let handle = ui
-                .add_sized(
-                    [128.0, 26.0],
-                    egui::Button::new(RichText::new("⠿  DRAG WINDOW").size(11.0).color(GOLD))
-                        .fill(Color32::from_rgba_premultiplied(25, 22, 18, 235))
-                        .stroke(Stroke::new(1.0_f32, GOLD_DIM))
-                        .sense(egui::Sense::click_and_drag()),
-                )
-                .on_hover_cursor(egui::CursorIcon::Grab)
-                .on_hover_text("Drag to move the in-game window");
-            if handle.hovered() && ui.input(|input| input.pointer.primary_pressed()) {
-                ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+            let (_, response) = ui.allocate_exact_size(size, egui::Sense::click_and_drag());
+            let response = response.on_hover_cursor(cursor);
+            if response.hovered() && ui.input(|input| input.pointer.primary_pressed()) {
+                ctx.send_viewport_cmd(egui::ViewportCommand::BeginResize(direction));
             }
         });
 }
