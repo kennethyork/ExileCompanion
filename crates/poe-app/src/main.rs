@@ -1807,19 +1807,6 @@ impl CompanionApp {
                 nav_button(ui, &mut self.page, Page::Trade, "◇  Trade inbox");
                 nav_button(ui, &mut self.page, Page::Tools, "◈  Tools");
                 nav_button(ui, &mut self.page, Page::Settings, "⚙  Settings");
-
-                ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
-                    ui.label(
-                        RichText::new("No game automation")
-                            .size(11.0)
-                            .color(TEXT_MUTED),
-                    );
-                    ui.horizontal(|ui| {
-                        ui.colored_label(SUCCESS, "●");
-                        ui.label(RichText::new("ToS-safe mode").color(TEXT_MUTED));
-                    });
-                    ui.add_space(8.0);
-                });
             });
     }
 
