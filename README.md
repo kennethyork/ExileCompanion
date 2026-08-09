@@ -116,7 +116,7 @@ The progression review also checks captured gems for movement, guard, aura/reser
 
 ## Backup and release packages
 
-Use **Settings → Backup and restore** to export a readable local JSON backup or merge one into the current installation. Settings also contains setup diagnostics and any locally written panic log.
+Use **Settings → Backup and restore** to export a readable local JSON backup or merge one into the current installation. SQLite itself is compiled into the application, and the schema/database file is created automatically in the current user's private application-data directory. Existing working-directory databases are migrated on first launch. Settings also contains setup diagnostics, the exact database path, and any locally written panic log.
 
 Tagged releases and manually dispatched GitHub Actions build a Linux AppImage and a Windows NSIS installer with `cargo-packager`. Both packages carry an offline English Tesseract runtime/data set, and the workflow runs the complete test suite before packaging.
 

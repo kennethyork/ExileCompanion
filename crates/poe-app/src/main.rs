@@ -28,7 +28,8 @@ const PANEL_ALT: Color32 = Color32::from_rgb(31, 29, 27);
 const TEXT_MUTED: Color32 = Color32::from_rgb(155, 151, 143);
 const SUCCESS: Color32 = Color32::from_rgb(105, 178, 115);
 const DANGER: Color32 = Color32::from_rgb(205, 92, 83);
-const CRASH_LOG_PATH: &str = "exile-companion-crash.log";
+const DATABASE_FILE: &str = "exile-companion.db";
+const CRASH_LOG_FILE: &str = "exile-companion-crash.log";
 const EQUIPMENT_SLOTS: &[&str] = &[
     "Helmet",
     "Body Armour",
@@ -100,10 +101,14 @@ fn install_panic_log_hook() {
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         use std::io::Write;
+        let path = crash_log_path();
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
         if let Ok(mut file) = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
-            .open(CRASH_LOG_PATH)
+            .open(path)
         {
             let _ = writeln!(file, "{} · {info}", chrono::Utc::now().to_rfc3339());
         }
@@ -244,6 +249,7 @@ struct CompanionApp {
     stats: SessionStats,
     status: String,
     store: Option<EventStore>,
+    database_path: PathBuf,
     pob_input: String,
     pob_build: Option<PobBuild>,
     pob_status: String,
@@ -322,12 +328,17 @@ struct CompanionApp {
     diagnostics: Vec<DiagnosticResult>,
     backup_status: String,
     crash_log: String,
+    crash_log_path: PathBuf,
 }
 
 impl CompanionApp {
     fn new() -> Self {
         let guessed = discover_client_log().unwrap_or_default();
-        let store = EventStore::open(&PathBuf::from("exile-companion.db")).ok();
+        let database_path = database_path();
+        let legacy_database = PathBuf::from(DATABASE_FILE);
+        let _ = migrate_legacy_database(&legacy_database, &database_path);
+        let store = EventStore::open(&database_path).ok();
+        let crash_log_path = crash_log_path();
         let snapshots = store
             .as_ref()
             .and_then(|store| store.character_snapshots(20).ok())
@@ -388,7 +399,12 @@ impl CompanionApp {
             height: stored_f32(&store, "ocr.crop.height").unwrap_or(0.8),
         }
         .normalized();
-        let diagnostics = initial_diagnostics(&guessed, store.is_some(), &screenshot_watch_folder);
+        let diagnostics = initial_diagnostics(
+            &guessed,
+            store.is_some(),
+            &database_path,
+            &screenshot_watch_folder,
+        );
         let passive_data_path = stored_text(&store, "passives.data_path", "");
         let passive_node_names = std::fs::read_to_string(&passive_data_path)
             .ok()
@@ -412,6 +428,7 @@ impl CompanionApp {
             stats: SessionStats::default(),
             status: "Choose your Client.txt file to begin".into(),
             store,
+            database_path,
             pob_input: String::new(),
             pob_build: None,
             pob_status: "No Path of Building snapshot imported".into(),
@@ -492,7 +509,8 @@ impl CompanionApp {
             diagnostics,
             backup_status:
                 "Backups include characters, map runs, planner data, and capture settings".into(),
-            crash_log: std::fs::read_to_string(CRASH_LOG_PATH).unwrap_or_default(),
+            crash_log: std::fs::read_to_string(&crash_log_path).unwrap_or_default(),
+            crash_log_path,
         }
     }
 
@@ -757,6 +775,7 @@ impl CompanionApp {
         self.diagnostics = initial_diagnostics(
             std::path::Path::new(self.log_path.trim()),
             self.store.is_some(),
+            &self.database_path,
             &self.screenshot_watch_folder,
         );
         let ollama = match OllamaClient::new(&self.ai_endpoint).and_then(|client| client.models()) {
@@ -3797,7 +3816,7 @@ impl CompanionApp {
                         );
                         if ui.button("Clear crash log").clicked() {
                             self.crash_log.clear();
-                            let _ = std::fs::remove_file(CRASH_LOG_PATH);
+                            let _ = std::fs::remove_file(&self.crash_log_path);
                         }
                     });
                 }
@@ -4358,9 +4377,85 @@ fn stored_text(store: &Option<EventStore>, key: &str, fallback: &str) -> String 
         .unwrap_or_else(|| fallback.to_string())
 }
 
+fn app_data_directory() -> PathBuf {
+    if let Some(path) = std::env::var_os("EXILE_COMPANION_DATA_DIR") {
+        return PathBuf::from(path);
+    }
+    platform_data_directory(
+        cfg!(windows),
+        std::env::var_os("LOCALAPPDATA").map(PathBuf::from),
+        std::env::var_os("XDG_DATA_HOME").map(PathBuf::from),
+        std::env::var_os("HOME").map(PathBuf::from),
+        std::env::current_dir()
+            .unwrap_or_else(|_| std::env::temp_dir())
+            .join("ExileCompanionData"),
+    )
+}
+
+fn platform_data_directory(
+    windows: bool,
+    local_app_data: Option<PathBuf>,
+    xdg_data_home: Option<PathBuf>,
+    user_home: Option<PathBuf>,
+    fallback: PathBuf,
+) -> PathBuf {
+    if windows {
+        local_app_data
+            .map(|path| path.join("ExileCompanion"))
+            .unwrap_or(fallback)
+    } else if let Some(path) = xdg_data_home {
+        path.join("exile-companion")
+    } else {
+        user_home
+            .map(|path| path.join(".local/share/exile-companion"))
+            .unwrap_or(fallback)
+    }
+}
+
+fn database_path() -> PathBuf {
+    let directory = app_data_directory();
+    let _ = std::fs::create_dir_all(&directory);
+    directory.join(DATABASE_FILE)
+}
+
+fn crash_log_path() -> PathBuf {
+    app_data_directory().join(CRASH_LOG_FILE)
+}
+
+fn migrate_legacy_database(
+    legacy: &std::path::Path,
+    target: &std::path::Path,
+) -> Result<(), String> {
+    if target.is_file() || !legacy.is_file() || legacy == target {
+        return Ok(());
+    }
+    let parent = target
+        .parent()
+        .ok_or_else(|| "Database target has no parent directory".to_string())?;
+    std::fs::create_dir_all(parent)
+        .map_err(|error| format!("Could not create the local data directory: {error}"))?;
+    if let Err(error) = std::fs::copy(legacy, target) {
+        let _ = std::fs::remove_file(target);
+        return Err(format!("Could not migrate the existing database: {error}"));
+    }
+
+    let legacy_wal = legacy.with_file_name(format!("{DATABASE_FILE}-wal"));
+    if legacy_wal.is_file() {
+        let target_wal = target.with_file_name(format!("{DATABASE_FILE}-wal"));
+        if let Err(error) = std::fs::copy(&legacy_wal, &target_wal) {
+            let _ = std::fs::remove_file(target);
+            return Err(format!(
+                "Could not migrate the existing database WAL: {error}"
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn initial_diagnostics(
     log_path: &std::path::Path,
     storage_ready: bool,
+    database_path: &std::path::Path,
     screenshot_folder: &str,
 ) -> Vec<DiagnosticResult> {
     let log_ready = log_path.is_file();
@@ -4408,9 +4503,9 @@ fn initial_diagnostics(
             name: "Local SQLite".into(),
             ready: storage_ready,
             detail: if storage_ready {
-                "Profiles, preferences, snapshots, and map runs can be saved".into()
+                format!("Embedded SQLite ready · {}", database_path.display())
             } else {
-                "The app could not open exile-companion.db".into()
+                format!("The app could not open {}", database_path.display())
             },
         },
         DiagnosticResult {
@@ -5083,6 +5178,51 @@ mod tests {
         );
         assert!(runtime.bundled);
 
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn chooses_private_platform_data_directories() {
+        assert_eq!(
+            platform_data_directory(
+                true,
+                Some(PathBuf::from("C:/Users/Test/AppData/Local")),
+                None,
+                None,
+                PathBuf::from("fallback")
+            ),
+            PathBuf::from("C:/Users/Test/AppData/Local/ExileCompanion")
+        );
+        assert_eq!(
+            platform_data_directory(
+                false,
+                None,
+                Some(PathBuf::from("/data")),
+                Some(PathBuf::from("/home/test")),
+                PathBuf::from("fallback")
+            ),
+            PathBuf::from("/data/exile-companion")
+        );
+    }
+
+    #[test]
+    fn migrates_an_existing_database_and_wal() {
+        let root =
+            std::env::temp_dir().join(format!("exile-companion-db-test-{}", new_profile_id()));
+        let legacy = root.join(DATABASE_FILE);
+        let legacy_wal = root.join(format!("{DATABASE_FILE}-wal"));
+        let target = root.join("data").join(DATABASE_FILE);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(&legacy, b"database").unwrap();
+        std::fs::write(&legacy_wal, b"wal").unwrap();
+
+        migrate_legacy_database(&legacy, &target).unwrap();
+
+        assert_eq!(std::fs::read(&target).unwrap(), b"database");
+        assert_eq!(
+            std::fs::read(target.with_file_name(format!("{DATABASE_FILE}-wal"))).unwrap(),
+            b"wal"
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
 
