@@ -104,7 +104,7 @@ Select **In-game HUD** or enable automatic HUD opening in Settings. The HUD stay
 
 Press `F10` while the companion has keyboard focus to toggle the HUD, or `Escape` to leave it. The HUD remembers its last position when exited. It never reads game memory or sends input to Path of Exile. Values labelled “captured” come from the most recent screenshot or clipboard action and are not live combat telemetry.
 
-Screenshot recognition uses the local `tesseract` executable and never uploads images. One-click captures are written to a temporary image and deleted immediately after OCR. The optional folder watcher ignores existing images and processes only new screenshots after they finish saving. On Debian/Ubuntu Tesseract is provided by the `tesseract-ocr` package. If Tesseract is unavailable, the OCR text box remains usable for manually supplied text.
+Screenshot recognition uses Tesseract locally and never uploads images. Windows and AppImage releases include the OCR engine and English recognition model, so release users do not need to install or configure Tesseract. Development builds prefer a bundled runtime when present and otherwise use the `tesseract` executable on `PATH`. One-click captures are written to a temporary image and deleted immediately after OCR. The optional folder watcher ignores existing images and processes only new screenshots after they finish saving. If OCR is unavailable, the editable OCR text box remains usable for manually supplied text.
 
 ## Local competitive toolkit
 
@@ -118,7 +118,7 @@ The progression review also checks captured gems for movement, guard, aura/reser
 
 Use **Settings → Backup and restore** to export a readable local JSON backup or merge one into the current installation. Settings also contains setup diagnostics and any locally written panic log.
 
-Tagged releases and manually dispatched GitHub Actions build a Linux AppImage and a Windows NSIS installer with `cargo-packager`. The workflow runs the complete test suite before packaging.
+Tagged releases and manually dispatched GitHub Actions build a Linux AppImage and a Windows NSIS installer with `cargo-packager`. Both packages carry an offline English Tesseract runtime/data set, and the workflow runs the complete test suite before packaging.
 
 ## Test
 

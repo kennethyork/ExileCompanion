@@ -29,7 +29,25 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: Install Linux build dependencies
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libx11-dev libxi-dev libgl1-mesa-dev libgtk-3-dev libfuse2
+        run: sudo apt-get update && sudo apt-get install -y libx11-dev libxi-dev libgl1-mesa-dev libgtk-3-dev libfuse2 tesseract-ocr tesseract-ocr-eng
+      - name: Stage bundled Linux OCR data
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          mkdir -p crates/poe-app/bundle/ocr-runtime/tessdata
+          cp /usr/share/tesseract-ocr/*/tessdata/eng.traineddata crates/poe-app/bundle/ocr-runtime/tessdata/eng.traineddata
+      - name: Stage bundled Windows OCR runtime
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          choco install tesseract --no-progress -y
+          $program = "${env:ProgramFiles}/Tesseract-OCR/tesseract.exe"
+          if (!(Test-Path $program)) { throw "Tesseract installer did not create $program" }
+          $source = Split-Path $program
+          $target = "crates/poe-app/bundle/ocr-runtime"
+          New-Item -ItemType Directory -Force $target | Out-Null
+          Copy-Item "$source/*" $target -Recurse -Force
+          & "$target/tesseract.exe" --version
       - name: Test workspace
         run: cargo test --workspace --locked
       - name: Install cargo-packager
@@ -43,3 +61,31 @@ jobs:
           name: ${{ matrix.artifact }}
           path: ${{ matrix.package_glob }}
           if-no-files-found: error
+
+  publish-release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: package
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - name: Download verified packages
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+      - name: Give release assets user-facing names
+        shell: bash
+        run: |
+          release_version="${GITHUB_REF_NAME#v}"
+          mv dist/exile-companion-linux/poe-app_*_x86_64.AppImage "dist/ExileCompanion-${release_version}-x86_64.AppImage"
+          mv dist/exile-companion-windows/poe-app_*_x64-setup.exe "dist/ExileCompanion-${release_version}-x64-setup.exe"
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            dist/ExileCompanion-*.AppImage \
+            dist/ExileCompanion-*-setup.exe \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "Exile Companion $GITHUB_REF_NAME" \
+            --generate-notes

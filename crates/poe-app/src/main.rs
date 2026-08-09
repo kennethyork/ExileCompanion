@@ -3968,14 +3968,19 @@ fn run_tesseract(
     } else {
         path
     };
-    let result = std::process::Command::new("tesseract")
+    let runtime = tesseract_runtime();
+    let mut command = std::process::Command::new(&runtime.program);
+    if let Some(tessdata) = &runtime.tessdata {
+        command.env("TESSDATA_PREFIX", tessdata);
+    }
+    let result = command
         .arg(target)
         .arg("stdout")
         .args(["--psm", "6", "tsv"])
         .output()
         .map_err(|error| {
             if error.kind() == std::io::ErrorKind::NotFound {
-                "Tesseract OCR is not installed. Install the 'tesseract-ocr' package, or paste OCR text manually.".to_string()
+                "The bundled OCR engine could not be found. Reinstall Exile Companion, install tesseract-ocr, or paste OCR text manually.".to_string()
             } else {
                 format!("Could not start local OCR: {error}")
             }
@@ -3994,6 +3999,59 @@ fn run_tesseract(
         let _ = std::fs::remove_file(cropped);
     }
     result
+}
+
+#[derive(Debug, Clone)]
+struct TesseractRuntime {
+    program: PathBuf,
+    tessdata: Option<PathBuf>,
+    bundled: bool,
+}
+
+fn tesseract_runtime() -> TesseractRuntime {
+    let current_exe = std::env::current_exe().ok();
+    let appdir = std::env::var_os("APPDIR").map(PathBuf::from);
+    find_bundled_tesseract(current_exe.as_deref(), appdir.as_deref()).unwrap_or_else(|| {
+        TesseractRuntime {
+            program: PathBuf::from("tesseract"),
+            tessdata: None,
+            bundled: false,
+        }
+    })
+}
+
+fn find_bundled_tesseract(
+    current_exe: Option<&std::path::Path>,
+    appdir: Option<&std::path::Path>,
+) -> Option<TesseractRuntime> {
+    if let Some(executable_dir) = current_exe.and_then(std::path::Path::parent) {
+        let runtime_dir = executable_dir.join("ocr-runtime");
+        let program = runtime_dir.join(if cfg!(windows) {
+            "tesseract.exe"
+        } else {
+            "tesseract"
+        });
+        if program.is_file() {
+            return Some(TesseractRuntime {
+                program,
+                tessdata: Some(runtime_dir.join("tessdata")),
+                bundled: true,
+            });
+        }
+    }
+
+    let appdir = appdir?;
+    let program = appdir.join("usr/bin/tesseract");
+    program.is_file().then(|| TesseractRuntime {
+        program,
+        tessdata: Some(
+            appdir
+                .join("usr/lib")
+                .join(env!("CARGO_PKG_NAME"))
+                .join("ocr-runtime/tessdata"),
+        ),
+        bundled: true,
+    })
 }
 
 fn crop_ocr_region(
@@ -4319,9 +4377,12 @@ fn initial_diagnostics(
     screenshot_folder: &str,
 ) -> Vec<DiagnosticResult> {
     let log_ready = log_path.is_file();
-    let tesseract = std::process::Command::new("tesseract")
-        .arg("--version")
-        .output();
+    let runtime = tesseract_runtime();
+    let mut command = std::process::Command::new(&runtime.program);
+    if let Some(tessdata) = &runtime.tessdata {
+        command.env("TESSDATA_PREFIX", tessdata);
+    }
+    let tesseract = command.arg("--version").output();
     let (tesseract_ready, tesseract_detail) = match tesseract {
         Ok(output) if output.status.success() => {
             let version = String::from_utf8_lossy(&output.stdout)
@@ -4329,7 +4390,12 @@ fn initial_diagnostics(
                 .next()
                 .unwrap_or("Tesseract available")
                 .to_string();
-            (true, version)
+            let source = if runtime.bundled {
+                "bundled; no separate install required"
+            } else {
+                "system installation"
+            };
+            (true, format!("{version} ({source})"))
         }
         Ok(output) => (
             false,
@@ -4337,7 +4403,7 @@ fn initial_diagnostics(
         ),
         Err(_) => (
             false,
-            "Install tesseract-ocr or use the editable OCR text box".into(),
+            "Bundled OCR missing; reinstall the app or use the editable OCR text box".into(),
         ),
     };
     let screenshot_ready = PathBuf::from(screenshot_folder.trim()).is_dir();
@@ -5012,6 +5078,25 @@ mod tests {
         let result = parse_tesseract_tsv(tsv).unwrap();
         assert_eq!(result.text, "Life: 4,123\nMana: 900");
         assert_eq!(result.confidence, Some(75.0));
+    }
+
+    #[test]
+    fn finds_appimage_ocr_runtime_and_model() {
+        let root =
+            std::env::temp_dir().join(format!("exile-companion-runtime-test-{}", new_profile_id()));
+        let program = root.join("usr/bin/tesseract");
+        std::fs::create_dir_all(program.parent().unwrap()).unwrap();
+        std::fs::write(&program, []).unwrap();
+
+        let runtime = find_bundled_tesseract(None, Some(&root)).unwrap();
+        assert_eq!(runtime.program, program);
+        assert_eq!(
+            runtime.tessdata,
+            Some(root.join("usr/lib/poe-app/ocr-runtime/tessdata"))
+        );
+        assert!(runtime.bundled);
+
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

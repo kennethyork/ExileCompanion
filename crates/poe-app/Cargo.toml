@@ -30,3 +30,10 @@ long-description = "Local character capture, Client.txt session tools, map analy
 icons = ["assets/icon.png"]
 before-packaging-command = "cargo build --release -p poe-app"
 binaries = [{ path = "poe-app", main = true }]
+resources = [
+    { src = "bundle/ocr-runtime", target = "ocr-runtime" },
+    { src = "THIRD_PARTY_NOTICES.md", target = "THIRD_PARTY_NOTICES.md" },
+]
+
+[package.metadata.packager.appimage]
+bins = ["/usr/bin/tesseract"]

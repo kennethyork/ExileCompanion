@@ -2618,7 +2618,7 @@ dependencies = [
 
 [[package]]
 name = "poe-ai"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "reqwest",
@@ -2627,7 +2627,7 @@ dependencies = [
 
 [[package]]
 name = "poe-app"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "arboard",
@@ -2648,7 +2648,7 @@ dependencies = [
 
 [[package]]
 name = "poe-character"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "base64",
@@ -2659,7 +2659,7 @@ dependencies = [
 
 [[package]]
 name = "poe-core"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "chrono",
  "serde",
@@ -2667,7 +2667,7 @@ dependencies = [
 
 [[package]]
 name = "poe-logs"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "poe-core",
@@ -2675,14 +2675,14 @@ dependencies = [
 
 [[package]]
 name = "poe-platform"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "sysinfo",
 ]
 
 [[package]]
 name = "poe-pob"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "base64",
@@ -2692,7 +2692,7 @@ dependencies = [
 
 [[package]]
 name = "poe-storage"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "poe-core",
