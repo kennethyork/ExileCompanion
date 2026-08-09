@@ -2,10 +2,10 @@ use eframe::egui::{self, Color32, RichText, Stroke};
 use poe_ai::{ChatMessage, OllamaClient};
 use poe_character::{
     inspect_passive_tree_url, parse_character_identity_text, parse_character_sheet_text,
-    parse_item_text, DetectedCharacterIdentity, OfflineCharacter,
+    parse_item_text, CapturedItem, DetectedCharacterIdentity, OfflineCharacter,
 };
-use poe_core::{EventKind, GameEvent, SessionStats};
-use poe_logs::spawn_tail;
+use poe_core::{parse_trade_request, EventKind, GameEvent, SessionStats, TradeRequest};
+use poe_logs::{spawn_tail, LogUpdate};
 use poe_platform::{discover_client_log, is_poe_running};
 use poe_pob::PobBuild;
 use poe_storage::{CharacterSnapshotRecord, EventStore};
@@ -128,13 +128,26 @@ enum CompactPanel {
     Assistant,
     Character,
     Events,
+    Settings,
+}
+
+#[derive(Debug, Clone)]
+struct OcrResult {
+    text: String,
+    confidence: Option<f32>,
+}
+
+#[derive(Debug, Clone)]
+struct HudAlert {
+    text: String,
+    important: bool,
 }
 
 struct CompanionApp {
     page: Page,
     filter: EventFilter,
     log_path: String,
-    receiver: Option<Receiver<GameEvent>>,
+    receiver: Option<Receiver<LogUpdate>>,
     stop: Option<Arc<AtomicBool>>,
     recent: VecDeque<GameEvent>,
     stats: SessionStats,
@@ -152,7 +165,10 @@ struct CompanionApp {
     passive_status: String,
     ocr_text: String,
     ocr_status: String,
-    ocr_receiver: Option<Receiver<Result<String, String>>>,
+    ocr_receiver: Option<Receiver<Result<OcrResult, String>>>,
+    ocr_confidence: Option<f32>,
+    ocr_needs_review: bool,
+    last_character_capture: Option<std::time::Instant>,
     restore_after_ocr: bool,
     auto_analyze_character: bool,
     character_analysis_pending: bool,
@@ -177,6 +193,17 @@ struct CompanionApp {
     overlay_mode: bool,
     compact_mode: bool,
     compact_panel: CompactPanel,
+    hud_alerts: VecDeque<HudAlert>,
+    dismissed_trades: HashSet<String>,
+    live_trades: VecDeque<TradeRequest>,
+    current_area: String,
+    area_entered_at: Option<std::time::Instant>,
+    session_started_at: std::time::Instant,
+    item_comparison: String,
+    hud_opacity: f32,
+    hud_locked: bool,
+    hud_extra_compact: bool,
+    hud_position: Option<egui::Pos2>,
 }
 
 impl CompanionApp {
@@ -210,6 +237,17 @@ impl CompanionApp {
         let screenshot_watch_folder = default_screenshot_folder()
             .map(|path| path.display().to_string())
             .unwrap_or_default();
+        let hud_opacity = store
+            .as_ref()
+            .and_then(|store| store.preference("hud.opacity").ok().flatten())
+            .and_then(|value| value.parse::<f32>().ok())
+            .unwrap_or(0.96)
+            .clamp(0.55, 1.0);
+        let hud_locked = stored_bool(&store, "hud.locked", false);
+        let hud_extra_compact = stored_bool(&store, "hud.extra_compact", false);
+        let hud_position = stored_f32(&store, "hud.x")
+            .zip(stored_f32(&store, "hud.y"))
+            .map(|(x, y)| egui::pos2(x, y));
         Self {
             page: Page::Dashboard,
             filter: EventFilter::All,
@@ -233,6 +271,9 @@ impl CompanionApp {
             ocr_text: String::new(),
             ocr_status: "Select a character-sheet screenshot or paste OCR text".into(),
             ocr_receiver: None,
+            ocr_confidence: None,
+            ocr_needs_review: false,
+            last_character_capture: None,
             restore_after_ocr: false,
             auto_analyze_character: false,
             character_analysis_pending: false,
@@ -259,11 +300,52 @@ impl CompanionApp {
             overlay_mode: false,
             compact_mode: false,
             compact_panel: CompactPanel::Assistant,
+            hud_alerts: VecDeque::new(),
+            dismissed_trades: HashSet::new(),
+            live_trades: VecDeque::new(),
+            current_area: String::new(),
+            area_entered_at: None,
+            session_started_at: std::time::Instant::now(),
+            item_comparison: String::new(),
+            hud_opacity,
+            hud_locked,
+            hud_extra_compact,
+            hud_position,
         }
     }
 
     fn is_monitoring(&self) -> bool {
         self.receiver.is_some()
+    }
+
+    fn push_hud_alert(&mut self, text: impl Into<String>, important: bool) {
+        self.hud_alerts.push_front(HudAlert {
+            text: text.into(),
+            important,
+        });
+        self.hud_alerts.truncate(8);
+    }
+
+    fn save_hud_preferences(&self) {
+        let Some(store) = &self.store else {
+            return;
+        };
+        let _ = store.set_preference("hud.opacity", &self.hud_opacity.to_string());
+        let _ = store.set_preference("hud.locked", bool_text(self.hud_locked));
+        let _ = store.set_preference("hud.extra_compact", bool_text(self.hud_extra_compact));
+        if let Some(position) = self.hud_position {
+            let _ = store.set_preference("hud.x", &position.x.to_string());
+            let _ = store.set_preference("hud.y", &position.y.to_string());
+        }
+    }
+
+    fn apply_hud_size(&self, ctx: &egui::Context) {
+        let size = if self.hud_extra_compact {
+            egui::vec2(410.0, 350.0)
+        } else {
+            egui::vec2(460.0, 420.0)
+        };
+        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
     }
 
     fn persist_current_character(&mut self) {
@@ -290,11 +372,12 @@ impl CompanionApp {
         self.persist_current_character();
         self.active_character_index = index;
         self.offline_character = self.characters[index].clone();
-        self.character_analysis.clear();
+        self.character_analysis = self.offline_character.ollama_review.clone();
         self.snapshot_status = format!(
             "Switched to {}",
             character_display_name(&self.offline_character)
         );
+        self.push_hud_alert(self.snapshot_status.clone(), false);
     }
 
     fn add_character(&mut self) {
@@ -305,6 +388,7 @@ impl CompanionApp {
         self.offline_character = character;
         self.character_analysis.clear();
         self.snapshot_status = "Created a new local character profile".into();
+        self.push_hud_alert(self.snapshot_status.clone(), false);
         self.persist_current_character();
     }
 
@@ -410,6 +494,15 @@ impl CompanionApp {
         match parse_item_text(&self.item_slot, &self.item_input) {
             Ok(item) => {
                 let item_name = item.name.clone();
+                self.item_comparison = self
+                    .offline_character
+                    .items
+                    .iter()
+                    .find(|existing| existing.slot == self.item_slot)
+                    .map_or_else(
+                        || format!("{item_name} fills an uncaptured {} slot", self.item_slot),
+                        |existing| compare_captured_items(existing, &item),
+                    );
                 self.offline_character
                     .items
                     .retain(|existing| existing.slot != self.item_slot);
@@ -418,6 +511,7 @@ impl CompanionApp {
                     .items
                     .sort_by(|left, right| left.slot.cmp(&right.slot));
                 self.capture_status = format!("Captured {item_name} in {}", self.item_slot);
+                self.push_hud_alert(self.item_comparison.clone(), false);
                 self.item_input.clear();
                 self.persist_current_character();
             }
@@ -603,8 +697,42 @@ impl CompanionApp {
     }
 
     fn parse_ocr_text(&mut self) -> bool {
+        self.apply_ocr_text(true)
+    }
+
+    fn apply_ocr_text(&mut self, force: bool) -> bool {
         let identity = parse_character_identity_text(&self.ocr_text).unwrap_or_default();
         let has_identity = identity.has_values();
+        let close_match = identity.name.as_deref().and_then(|name| {
+            self.characters
+                .iter()
+                .enumerate()
+                .filter(|(_, character)| !character.name.is_empty())
+                .map(|(index, character)| (index, edit_distance(name, &character.name)))
+                .filter(|(_, distance)| (1..=2).contains(distance))
+                .min_by_key(|(_, distance)| *distance)
+                .map(|(index, _)| index)
+        });
+        let low_confidence = self
+            .ocr_confidence
+            .is_some_and(|confidence| confidence < 55.0);
+        if !force && (low_confidence || close_match.is_some()) {
+            self.ocr_needs_review = true;
+            let confidence = self
+                .ocr_confidence
+                .map_or_else(|| "unknown".into(), |value| format!("{value:.0}%"));
+            self.ocr_status = if let Some(index) = close_match {
+                format!(
+                    "Review before import: OCR name is close to {} (confidence {confidence})",
+                    character_display_name(&self.characters[index])
+                )
+            } else {
+                format!("Review before import: OCR confidence is {confidence}")
+            };
+            self.push_hud_alert(self.ocr_status.clone(), true);
+            return false;
+        }
+        self.ocr_needs_review = false;
         let created = self.select_character_for_identity(&identity);
         if has_identity {
             self.apply_detected_identity(identity);
@@ -620,6 +748,7 @@ impl CompanionApp {
             return false;
         }
         self.persist_current_character();
+        self.last_character_capture = Some(std::time::Instant::now());
         let name = character_display_name(&self.offline_character);
         self.ocr_status = if created {
             format!("Created {name} and imported {stat_count} character-sheet values")
@@ -630,6 +759,7 @@ impl CompanionApp {
                 "Imported {stat_count} values into {name}; the character name was not visible to OCR"
             )
         };
+        self.push_hud_alert(self.ocr_status.clone(), false);
         true
     }
 
@@ -651,6 +781,7 @@ impl CompanionApp {
         }
         self.ai_input = "Analyze my captured character snapshot. Start with a short summary, identify the clearest weaknesses or missing information, and give three practical next checks. Clearly distinguish OCR character-sheet totals from partial equipment contributions. Do not invent passive effects, current prices, or patch-specific facts that are not in the supplied context.".into();
         self.character_analysis.clear();
+        self.offline_character.ollama_review.clear();
         self.ask_ollama();
         if self.ai_receiver.is_some() {
             self.character_analysis_pending = true;
@@ -663,12 +794,14 @@ impl CompanionApp {
         };
         if let Ok(result) = receiver.try_recv() {
             let parsed = match result {
-                Ok(text) => {
-                    self.ocr_text = text;
-                    self.parse_ocr_text()
+                Ok(result) => {
+                    self.ocr_text = result.text;
+                    self.ocr_confidence = result.confidence;
+                    self.apply_ocr_text(false)
                 }
                 Err(error) => {
-                    self.ocr_status = error;
+                    self.ocr_status = error.clone();
+                    self.push_hud_alert(format!("OCR failed: {error}"), true);
                     false
                 }
             };
@@ -735,6 +868,7 @@ impl CompanionApp {
                     self.active_character_index = self.characters.len() - 1;
                 }
                 self.offline_character = character;
+                self.character_analysis = self.offline_character.ollama_review.clone();
                 self.persist_current_character();
                 self.snapshot_status = "Loaded saved character snapshot".into();
             }
@@ -825,9 +959,44 @@ impl CompanionApp {
             return;
         };
         let mut character_changed = false;
-        while let Ok(event) = receiver.try_recv() {
-            self.stats.record(&event);
-            if event.kind == EventKind::LevelUp {
+        let mut alerts = Vec::new();
+        let mut trades = Vec::new();
+        while let Ok(update) = receiver.try_recv() {
+            let event = update.event;
+            if !update.historical {
+                self.stats.record(&event);
+            }
+            if !update.historical {
+                match &event.kind {
+                    EventKind::AreaEntered => {}
+                    EventKind::TradeWhisper => {
+                        let trade = parse_trade_request(&event.message);
+                        alerts.push((
+                            trade.as_ref().map_or_else(
+                                || "New trade whisper".into(),
+                                |trade| {
+                                    format!(
+                                        "Trade: {} wants {} for {}",
+                                        trade.buyer, trade.item, trade.price
+                                    )
+                                },
+                            ),
+                            true,
+                        ));
+                        if let Some(trade) = trade {
+                            trades.push(trade);
+                        }
+                    }
+                    EventKind::Death => alerts.push(("Character death recorded".into(), true)),
+                    EventKind::LevelUp => alerts.push((event.message.clone(), false)),
+                    EventKind::Chat | EventKind::System => {}
+                }
+            }
+            if event.kind == EventKind::AreaEntered {
+                self.current_area = event.message.clone();
+                self.area_entered_at = (!update.historical).then(std::time::Instant::now);
+            }
+            if !update.historical && event.kind == EventKind::LevelUp {
                 if let Some(level) = event
                     .message
                     .split(|character: char| !character.is_ascii_digit())
@@ -839,14 +1008,23 @@ impl CompanionApp {
                     character_changed = true;
                 }
             }
-            if let Some(store) = &self.store {
-                let _ = store.record(&event);
+            if !update.historical {
+                if let Some(store) = &self.store {
+                    let _ = store.record(&event);
+                }
             }
             self.recent.push_front(event);
             self.recent.truncate(200);
         }
         if character_changed {
             self.persist_current_character();
+        }
+        for (text, important) in alerts {
+            self.push_hud_alert(text, important);
+        }
+        for trade in trades {
+            self.live_trades.push_front(trade);
+            self.live_trades.truncate(20);
         }
     }
 
@@ -855,18 +1033,29 @@ impl CompanionApp {
             return;
         };
         if let Ok(result) = receiver.try_recv() {
-            match result {
+            let mut character_review_changed = false;
+            let (alert, important) = match result {
                 Ok(answer) => {
                     if self.character_analysis_pending {
                         self.character_analysis = answer.clone();
+                        self.offline_character.ollama_review = answer.clone();
+                        character_review_changed = true;
                     }
                     self.ai_messages.push(ChatMessage::new("assistant", answer));
                     self.ai_status = "Answer generated locally".into();
+                    ("Ollama response ready".to_string(), false)
                 }
-                Err(error) => self.ai_status = error,
-            }
+                Err(error) => {
+                    self.ai_status = error.clone();
+                    (format!("Ollama failed: {error}"), true)
+                }
+            };
             self.character_analysis_pending = false;
             self.ai_receiver = None;
+            if character_review_changed {
+                self.persist_current_character();
+            }
+            self.push_hud_alert(alert, important);
         }
     }
 
@@ -908,12 +1097,18 @@ impl CompanionApp {
         ctx.send_viewport_cmd(egui::ViewportCommand::MousePassthrough(false));
         ctx.send_viewport_cmd(egui::ViewportCommand::Resizable(true));
         ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(egui::vec2(
-            400.0, 330.0,
+            390.0, 320.0,
         )));
-        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(460.0, 420.0)));
+        if let Some(position) = self.hud_position {
+            ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(position));
+        }
+        self.apply_hud_size(ctx);
     }
 
     fn exit_overlay(&mut self, ctx: &egui::Context) {
+        self.hud_position =
+            ctx.input(|input| input.viewport().outer_rect.map(|rect| rect.left_top()));
+        self.save_hud_preferences();
         self.overlay_mode = false;
         self.compact_mode = false;
         ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(
@@ -1619,6 +1814,25 @@ impl CompanionApp {
                         .desired_width(f32::INFINITY),
                 );
                 ui.label(RichText::new(&self.ocr_status).color(TEXT_MUTED));
+                if let Some(confidence) = self.ocr_confidence {
+                    ui.label(
+                        RichText::new(format!("OCR confidence: {confidence:.0}%"))
+                            .size(11.0)
+                            .color(if confidence >= 70.0 { SUCCESS } else { GOLD }),
+                    );
+                }
+                if self.ocr_needs_review {
+                    ui.horizontal(|ui| {
+                        ui.colored_label(GOLD, "Review this OCR result before importing it.");
+                        if ui.button("Apply anyway").clicked() {
+                            self.apply_ocr_text(true);
+                        }
+                        if ui.button("Discard result").clicked() {
+                            self.ocr_needs_review = false;
+                            self.ocr_status = "OCR result discarded".into();
+                        }
+                    });
+                }
                 ui.separator();
                 ui.label(
                     RichText::new("OPTIONAL SCREENSHOT-FOLDER WATCHER")
@@ -2029,7 +2243,12 @@ impl CompanionApp {
         egui::CentralPanel::default()
             .frame(
                 egui::Frame::new()
-                    .fill(Color32::from_rgba_premultiplied(16, 15, 14, 245))
+                    .fill(Color32::from_rgba_premultiplied(
+                        16,
+                        15,
+                        14,
+                        (255.0 * self.hud_opacity) as u8,
+                    ))
                     .stroke(Stroke::new(1.0_f32, GOLD_DIM))
                     .inner_margin(14.0),
             )
@@ -2042,11 +2261,15 @@ impl CompanionApp {
                             egui::Label::new(
                                 RichText::new("EXILE HUD     ::  DRAG").color(GOLD).strong(),
                             )
-                            .sense(egui::Sense::click_and_drag()),
+                            .sense(if self.hud_locked {
+                                egui::Sense::hover()
+                            } else {
+                                egui::Sense::click_and_drag()
+                            }),
                         )
                         .on_hover_cursor(egui::CursorIcon::Grab)
                         .on_hover_text("Drag to move the overlay");
-                    if drag.drag_started() {
+                    if !self.hud_locked && drag.drag_started() {
                         ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -2088,6 +2311,33 @@ impl CompanionApp {
                         );
                     });
                 });
+                if let Some(alert) = self.hud_alerts.front().cloned() {
+                    egui::Frame::new()
+                        .fill(if alert.important {
+                            Color32::from_rgb(58, 29, 25)
+                        } else {
+                            Color32::from_rgb(36, 34, 27)
+                        })
+                        .stroke(Stroke::new(
+                            1.0,
+                            if alert.important { DANGER } else { GOLD_DIM },
+                        ))
+                        .corner_radius(4.0)
+                        .inner_margin(egui::Margin::symmetric(8, 5))
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new(alert.text).size(10.0));
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        if ui.small_button("Dismiss").clicked() {
+                                            self.hud_alerts.pop_front();
+                                        }
+                                    },
+                                );
+                            });
+                        });
+                }
                 ui.add_space(4.0);
                 ui.horizontal(|ui| {
                     compact_tab(
@@ -2103,6 +2353,7 @@ impl CompanionApp {
                         "Character",
                     );
                     compact_tab(ui, &mut self.compact_panel, CompactPanel::Events, "Events");
+                    compact_tab(ui, &mut self.compact_panel, CompactPanel::Settings, "HUD");
                 });
                 ui.separator();
 
@@ -2110,6 +2361,7 @@ impl CompanionApp {
                     CompactPanel::Assistant => self.compact_assistant(ui),
                     CompactPanel::Character => self.compact_character(ui, ctx),
                     CompactPanel::Events => self.compact_events(ui),
+                    CompactPanel::Settings => self.compact_settings(ui, ctx),
                 }
             });
     }
@@ -2127,7 +2379,30 @@ impl CompanionApp {
                 self.ai_input = "What important character information is missing from the captured snapshot? Give me the shortest useful capture checklist.".into();
                 self.ask_ollama();
             }
+            if ui.small_button("Compare saved").clicked() {
+                if let Some(data) = self.snapshots.first().map(|snapshot| snapshot.data.clone()) {
+                    self.compare_character_snapshot(&data);
+                    self.push_hud_alert(self.snapshot_status.clone(), false);
+                } else {
+                    self.push_hud_alert("No saved snapshot is available to compare", true);
+                }
+            }
         });
+        ui.label(
+            RichText::new(format!(
+                "LOCAL CONTEXT · character {} · OCR {} · {} log events",
+                if self.has_character_data() {
+                    "captured"
+                } else {
+                    "missing"
+                },
+                self.ocr_confidence
+                    .map_or_else(|| "not scored".into(), |value| format!("{value:.0}%")),
+                self.recent.len().min(30)
+            ))
+            .size(9.0)
+            .color(TEXT_MUTED),
+        );
         egui::ScrollArea::vertical()
             .max_height(185.0)
             .stick_to_bottom(true)
@@ -2234,6 +2509,18 @@ impl CompanionApp {
             }
         });
         ui.label(RichText::new(&self.ocr_status).size(10.0).color(TEXT_MUTED));
+        if self.ocr_needs_review {
+            ui.horizontal(|ui| {
+                ui.colored_label(GOLD, "OCR REVIEW REQUIRED");
+                if ui.small_button("Apply anyway").clicked() {
+                    self.apply_ocr_text(true);
+                }
+                if ui.small_button("Discard").clicked() {
+                    self.ocr_needs_review = false;
+                    self.ocr_status = "OCR result discarded".into();
+                }
+            });
+        }
         if self.ocr_receiver.is_some() {
             ui.spinner();
         }
@@ -2247,6 +2534,28 @@ impl CompanionApp {
             progress_chip(ui, !self.offline_character.items.is_empty(), "Equipment");
             progress_chip(ui, !self.offline_character.sheet_stats.is_empty(), "Stats");
         });
+        ui.label(
+            RichText::new(character_capture_freshness(self.last_character_capture))
+                .size(10.0)
+                .color(
+                    if self.last_character_capture.is_some_and(|capture| {
+                        capture.elapsed() < std::time::Duration::from_secs(600)
+                    }) {
+                        SUCCESS
+                    } else {
+                        GOLD
+                    },
+                ),
+        );
+        let defense_summary = captured_defense_summary(&self.offline_character);
+        ui.label(RichText::new(defense_summary).size(11.0));
+        if !self.item_comparison.is_empty() {
+            ui.label(
+                RichText::new(format!("LAST ITEM · {}", self.item_comparison))
+                    .size(10.0)
+                    .color(GOLD),
+            );
+        }
         egui::Grid::new("compact_character_stats")
             .num_columns(2)
             .striped(true)
@@ -2262,18 +2571,57 @@ impl CompanionApp {
             });
     }
 
-    fn compact_events(&self, ui: &mut egui::Ui) {
+    fn compact_events(&mut self, ui: &mut egui::Ui) {
         ui.horizontal_wrapped(|ui| {
             ui.label(format!("Areas {}", self.stats.areas));
             ui.label(format!("Levels {}", self.stats.levels));
             ui.colored_label(DANGER, format!("Deaths {}", self.stats.deaths));
             ui.label(format!("Trades {}", self.stats.trade_whispers));
         });
+        ui.label(
+            RichText::new(format!(
+                "Session {} · {}",
+                format_duration(self.session_started_at.elapsed()),
+                if self.current_area.is_empty() {
+                    "Area unknown".into()
+                } else {
+                    format!(
+                        "{} for {}",
+                        self.current_area,
+                        self.area_entered_at.map_or_else(
+                            || "?".into(),
+                            |entered| format_duration(entered.elapsed())
+                        )
+                    )
+                }
+            ))
+            .size(10.0)
+            .color(TEXT_MUTED),
+        );
         ui.separator();
         egui::ScrollArea::vertical()
-            .max_height(245.0)
+            .max_height(if self.hud_extra_compact { 170.0 } else { 245.0 })
             .show(ui, |ui| {
-                for event in self.recent.iter().take(8) {
+                let trades = self
+                    .live_trades
+                    .iter()
+                    .filter(|trade| !self.dismissed_trades.contains(&trade.raw_message))
+                    .take(3)
+                    .cloned()
+                    .collect::<Vec<_>>();
+                let mut handled = None;
+                for trade in trades {
+                    trade_card(ui, &trade, &mut handled);
+                }
+                if let Some(message) = handled {
+                    self.dismissed_trades.insert(message);
+                }
+                for event in self
+                    .recent
+                    .iter()
+                    .filter(|event| event.kind != EventKind::TradeWhisper)
+                    .take(6)
+                {
                     event_row(ui, event);
                 }
                 if self.recent.is_empty() {
@@ -2283,6 +2631,47 @@ impl CompanionApp {
                     });
                 }
             });
+    }
+
+    fn compact_settings(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let mut changed = false;
+        egui::ScrollArea::vertical()
+            .max_height(if self.hud_extra_compact { 190.0 } else { 265.0 })
+            .show(ui, |ui| {
+                ui.heading("HUD appearance");
+                changed |= ui
+                    .add(egui::Slider::new(&mut self.hud_opacity, 0.55..=1.0).text("Opacity"))
+                    .changed();
+                changed |= ui
+                    .checkbox(&mut self.hud_locked, "Lock HUD position and size")
+                    .changed();
+                if ui
+                    .checkbox(&mut self.hud_extra_compact, "Extra-compact size")
+                    .changed()
+                {
+                    changed = true;
+                    self.apply_hud_size(ctx);
+                }
+                ui.separator();
+                ui.label(RichText::new("LOCAL DATA SOURCES").size(10.0).color(GOLD));
+                ui.label("Client.txt · session and trade events");
+                ui.label("Screenshots · identity and captured sheet values");
+                ui.label("Clipboard · user-copied equipment");
+                ui.label("SQLite · profiles, snapshots and HUD preferences");
+                ui.label("Ollama · localhost-only analysis");
+                ui.add_space(8.0);
+                if ui.button("Hide to taskbar").clicked() {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+                }
+                ui.label(
+                    RichText::new("The HUD never reads game memory or sends game input.")
+                        .size(10.0)
+                        .color(TEXT_MUTED),
+                );
+            });
+        if changed {
+            self.save_hud_preferences();
+        }
     }
 
     fn tools(&self, ui: &mut egui::Ui) {
@@ -2453,6 +2842,16 @@ impl eframe::App for CompanionApp {
     }
 
     fn update(&mut self, ctx: &egui::Context, _: &mut eframe::Frame) {
+        if ctx.input(|input| input.key_pressed(egui::Key::F10)) {
+            if self.overlay_mode {
+                self.exit_overlay(ctx);
+            } else {
+                self.enter_compact_mode(ctx);
+            }
+        }
+        if self.overlay_mode && ctx.input(|input| input.key_pressed(egui::Key::Escape)) {
+            self.exit_overlay(ctx);
+        }
         self.poll_game(ctx);
         self.collect();
         self.collect_ai();
@@ -2461,7 +2860,9 @@ impl eframe::App for CompanionApp {
         ctx.request_repaint_after(std::time::Duration::from_millis(250));
         if self.overlay_mode && self.compact_mode {
             self.overlay(ctx);
-            resize_grip(ctx);
+            if !self.hud_locked {
+                resize_grip(ctx);
+            }
             return;
         }
         let viewport_width = ctx.input(|input| {
@@ -2506,11 +2907,11 @@ impl eframe::App for CompanionApp {
     }
 }
 
-fn run_tesseract(path: &std::path::Path) -> Result<String, String> {
+fn run_tesseract(path: &std::path::Path) -> Result<OcrResult, String> {
     std::process::Command::new("tesseract")
         .arg(path)
         .arg("stdout")
-        .args(["--psm", "6"])
+        .args(["--psm", "6", "tsv"])
         .output()
         .map_err(|error| {
             if error.kind() == std::io::ErrorKind::NotFound {
@@ -2521,7 +2922,7 @@ fn run_tesseract(path: &std::path::Path) -> Result<String, String> {
         })
         .and_then(|output| {
             if output.status.success() {
-                Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+                parse_tesseract_tsv(&String::from_utf8_lossy(&output.stdout))
             } else {
                 Err(format!(
                     "OCR failed: {}",
@@ -2529,6 +2930,40 @@ fn run_tesseract(path: &std::path::Path) -> Result<String, String> {
                 ))
             }
         })
+}
+
+fn parse_tesseract_tsv(tsv: &str) -> Result<OcrResult, String> {
+    let mut text = String::new();
+    let mut previous_line = None;
+    let mut confidence_total = 0.0_f32;
+    let mut confidence_count = 0_u32;
+    for row in tsv.lines().skip(1) {
+        let columns = row.splitn(12, '\t').collect::<Vec<_>>();
+        if columns.len() != 12 || columns[11].trim().is_empty() {
+            continue;
+        }
+        let line_key = (columns[1], columns[2], columns[3], columns[4]);
+        if previous_line.is_some() && previous_line != Some(line_key) {
+            text.push('\n');
+        } else if !text.is_empty() {
+            text.push(' ');
+        }
+        text.push_str(columns[11].trim());
+        previous_line = Some(line_key);
+        if let Ok(confidence) = columns[10].parse::<f32>() {
+            if confidence >= 0.0 {
+                confidence_total += confidence;
+                confidence_count += 1;
+            }
+        }
+    }
+    if text.trim().is_empty() {
+        return Err("OCR completed but did not recognize any text".into());
+    }
+    Ok(OcrResult {
+        text,
+        confidence: (confidence_count > 0).then(|| confidence_total / confidence_count as f32),
+    })
 }
 
 #[cfg(target_os = "linux")]
@@ -2688,6 +3123,161 @@ fn window_drag_handle(ctx: &egui::Context) {
                 ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
             }
         });
+}
+
+fn bool_text(value: bool) -> &'static str {
+    if value {
+        "true"
+    } else {
+        "false"
+    }
+}
+
+fn stored_bool(store: &Option<EventStore>, key: &str, fallback: bool) -> bool {
+    store
+        .as_ref()
+        .and_then(|store| store.preference(key).ok().flatten())
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(fallback)
+}
+
+fn stored_f32(store: &Option<EventStore>, key: &str) -> Option<f32> {
+    store
+        .as_ref()
+        .and_then(|store| store.preference(key).ok().flatten())
+        .and_then(|value| value.parse().ok())
+}
+
+fn edit_distance(left: &str, right: &str) -> usize {
+    let left = left.to_ascii_lowercase().into_bytes();
+    let right = right.to_ascii_lowercase().into_bytes();
+    let mut previous = (0..=right.len()).collect::<Vec<_>>();
+    for (left_index, left_byte) in left.iter().enumerate() {
+        let mut current = vec![left_index + 1];
+        for (right_index, right_byte) in right.iter().enumerate() {
+            current.push(std::cmp::min(
+                std::cmp::min(current[right_index] + 1, previous[right_index + 1] + 1),
+                previous[right_index] + usize::from(left_byte != right_byte),
+            ));
+        }
+        previous = current;
+    }
+    previous[right.len()]
+}
+
+fn compare_captured_items(previous: &CapturedItem, current: &CapturedItem) -> String {
+    let old = &previous.bonuses;
+    let new = &current.bonuses;
+    let changes = [
+        ("life", new.life - old.life),
+        ("ES", new.energy_shield - old.energy_shield),
+        ("armour", new.armour - old.armour),
+        ("evasion", new.evasion - old.evasion),
+        ("fire res", new.fire_resistance - old.fire_resistance),
+        ("cold res", new.cold_resistance - old.cold_resistance),
+        (
+            "lightning res",
+            new.lightning_resistance - old.lightning_resistance,
+        ),
+        ("chaos res", new.chaos_resistance - old.chaos_resistance),
+    ]
+    .into_iter()
+    .filter(|(_, change)| *change != 0)
+    .map(|(label, change)| format!("{label} {change:+}"))
+    .collect::<Vec<_>>();
+    if changes.is_empty() {
+        format!(
+            "{} → {} · no recognized stat change",
+            previous.name, current.name
+        )
+    } else {
+        format!(
+            "{} → {} · {}",
+            previous.name,
+            current.name,
+            changes.join(" · ")
+        )
+    }
+}
+
+fn character_capture_freshness(captured: Option<std::time::Instant>) -> String {
+    captured.map_or_else(
+        || "No character-sheet capture in this app session".into(),
+        |captured| format!("Captured {} ago", format_duration(captured.elapsed())),
+    )
+}
+
+fn captured_defense_summary(character: &OfflineCharacter) -> String {
+    let wanted = [
+        "Life",
+        "Energy Shield",
+        "Fire Resistance",
+        "Cold Resistance",
+        "Lightning Resistance",
+        "Chaos Resistance",
+    ];
+    let values = wanted
+        .iter()
+        .filter_map(|name| {
+            character
+                .sheet_stats
+                .get(*name)
+                .map(|value| format!("{name} {value}"))
+        })
+        .collect::<Vec<_>>();
+    if values.is_empty() {
+        "Captured defenses: missing — open the character sheet and capture it".into()
+    } else {
+        format!("Captured defenses · {}", values.join(" · "))
+    }
+}
+
+fn format_duration(duration: std::time::Duration) -> String {
+    let seconds = duration.as_secs();
+    if seconds >= 3600 {
+        format!("{}h {:02}m", seconds / 3600, (seconds % 3600) / 60)
+    } else if seconds >= 60 {
+        format!("{}m {:02}s", seconds / 60, seconds % 60)
+    } else {
+        format!("{seconds}s")
+    }
+}
+
+fn trade_card(ui: &mut egui::Ui, trade: &TradeRequest, handled: &mut Option<String>) {
+    egui::Frame::new()
+        .fill(Color32::from_rgb(26, 34, 43))
+        .stroke(Stroke::new(1.0, Color32::from_rgb(78, 119, 157)))
+        .corner_radius(4.0)
+        .inner_margin(8.0)
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new(&trade.buyer)
+                        .color(Color32::from_rgb(104, 154, 210))
+                        .strong(),
+                );
+                ui.label(format!("{} · {}", trade.item, trade.price));
+            });
+            if !trade.location.is_empty() {
+                ui.label(RichText::new(&trade.location).size(10.0).color(TEXT_MUTED));
+            }
+            ui.horizontal(|ui| {
+                if ui.small_button("Copy reply").clicked() {
+                    let reply = format!(
+                        "@{} Hi, are you still interested in {}?",
+                        trade.buyer, trade.item
+                    );
+                    let _ = arboard::Clipboard::new()
+                        .and_then(|mut clipboard| clipboard.set_text(reply));
+                }
+                let complete = ui.small_button("Complete").clicked();
+                let dismiss = ui.small_button("Dismiss").clicked();
+                if complete || dismiss {
+                    *handled = Some(trade.raw_message.clone());
+                }
+            });
+        });
+    ui.add_space(5.0);
 }
 
 fn new_profile_id() -> String {
@@ -2956,4 +3546,23 @@ fn tool_card(ui: &mut egui::Ui, title: &str, description: &str, badge: &str) {
             });
             ui.label(RichText::new(description).color(TEXT_MUTED));
         });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_tesseract_words_and_confidence() {
+        let tsv = "level\tpage_num\tblock_num\tpar_num\tline_num\tword_num\tleft\ttop\twidth\theight\tconf\ttext\n5\t1\t1\t1\t1\t1\t0\t0\t1\t1\t90\tLife:\n5\t1\t1\t1\t1\t2\t0\t0\t1\t1\t80\t4,123\n5\t1\t1\t1\t2\t1\t0\t0\t1\t1\t70\tMana:\n5\t1\t1\t1\t2\t2\t0\t0\t1\t1\t60\t900";
+        let result = parse_tesseract_tsv(tsv).unwrap();
+        assert_eq!(result.text, "Life: 4,123\nMana: 900");
+        assert_eq!(result.confidence, Some(75.0));
+    }
+
+    #[test]
+    fn identifies_close_ocr_names() {
+        assert_eq!(edit_distance("MapRunner", "MapRuner"), 1);
+        assert!(edit_distance("MapRunner", "OtherBuild") > 2);
+    }
 }

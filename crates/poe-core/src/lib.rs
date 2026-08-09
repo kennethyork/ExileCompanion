@@ -18,6 +18,16 @@ pub struct GameEvent {
     pub message: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TradeRequest {
+    pub buyer: String,
+    pub item: String,
+    pub price: String,
+    pub league: String,
+    pub location: String,
+    pub raw_message: String,
+}
+
 impl GameEvent {
     pub fn new(kind: EventKind, message: impl Into<String>) -> Self {
         Self {
@@ -77,6 +87,34 @@ pub fn parse_client_line(line: &str) -> Option<GameEvent> {
     Some(GameEvent::new(kind, useful))
 }
 
+pub fn parse_trade_request(message: &str) -> Option<TradeRequest> {
+    let buyer = message
+        .strip_prefix("@From ")?
+        .split_once(':')?
+        .0
+        .trim()
+        .to_string();
+    let request = message.split("buy your ").nth(1)?;
+    let (item, listing) = request.split_once(" listed for ")?;
+    let (price, remainder) = listing.split_once(" in ").unwrap_or((listing, ""));
+    let (league, details) = remainder
+        .split_once(" (stash tab ")
+        .unwrap_or((remainder.trim_end_matches('.'), ""));
+    let location = if details.is_empty() {
+        String::new()
+    } else {
+        details.trim_end_matches([')', '.']).to_string()
+    };
+    Some(TradeRequest {
+        buyer,
+        item: item.trim().to_string(),
+        price: price.trim().to_string(),
+        league: league.trim().to_string(),
+        location,
+        raw_message: message.to_string(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -112,5 +150,16 @@ mod tests {
             parse_client_line("2026/08/08 23:31:33 1 abcd [INFO Client 332] #Player: hello")
                 .unwrap();
         assert_eq!(event.kind, EventKind::Chat);
+    }
+
+    #[test]
+    fn parses_trade_request_details() {
+        let message = "@From BuyerOne: Hi, I would like to buy your Doom Crown listed for 10 chaos in Mirage (stash tab \"Sell\"; position: left 3, top 4)";
+        let trade = parse_trade_request(message).unwrap();
+        assert_eq!(trade.buyer, "BuyerOne");
+        assert_eq!(trade.item, "Doom Crown");
+        assert_eq!(trade.price, "10 chaos");
+        assert_eq!(trade.league, "Mirage");
+        assert!(trade.location.contains("Sell"));
     }
 }

@@ -60,6 +60,8 @@ pub struct OfflineCharacter {
     pub passive_tree_url: String,
     pub sheet_stats: BTreeMap<String, String>,
     pub items: Vec<CapturedItem>,
+    #[serde(default)]
+    pub ollama_review: String,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

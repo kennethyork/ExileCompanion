@@ -40,6 +40,10 @@ impl EventStore {
                 profile_id TEXT PRIMARY KEY,
                 updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 data TEXT NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS app_preferences (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
              );",
         )?;
         Ok(Self(connection))
@@ -109,6 +113,23 @@ impl EventStore {
         })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
+
+    pub fn set_preference(&self, key: &str, value: &str) -> Result<()> {
+        self.0.execute(
+            "INSERT INTO app_preferences (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![key, value],
+        )?;
+        Ok(())
+    }
+
+    pub fn preference(&self, key: &str) -> Result<Option<String>> {
+        let mut statement = self
+            .0
+            .prepare("SELECT value FROM app_preferences WHERE key = ?1")?;
+        let mut rows = statement.query([key])?;
+        Ok(rows.next()?.map(|row| row.get(0)).transpose()?)
+    }
 }
 
 #[cfg(test)]
@@ -145,5 +166,16 @@ mod tests {
         assert!(profiles.iter().any(|profile| {
             profile.profile_id == "local-1" && profile.data.contains("Updated")
         }));
+    }
+
+    #[test]
+    fn stores_preferences() {
+        let store = EventStore::open(Path::new(":memory:")).unwrap();
+        assert_eq!(store.preference("hud.opacity").unwrap(), None);
+        store.set_preference("hud.opacity", "0.85").unwrap();
+        assert_eq!(
+            store.preference("hud.opacity").unwrap().as_deref(),
+            Some("0.85")
+        );
     }
 }

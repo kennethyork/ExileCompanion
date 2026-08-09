@@ -15,6 +15,12 @@ A native Windows/Linux Path of Exile companion written in Rust. The project is i
 - Full pages open in the normal app instead of expanding over the game
 - In-game Assistant, Character, and Events tabs with one-click OCR capture and character review
 - Active-character selector, live PoE/log indicators, session counters, and an explicit Exit control
+- Local smart alerts for trades, deaths, level-ups, OCR results, character changes, and Ollama completion
+- Structured trade cards with buyer, item, price, stash location, copy-reply, complete, and dismiss controls
+- Current-area and session timers calculated from local `Client.txt` events
+- Captured-defense freshness, missing-data guidance, and local equipment comparison summaries
+- OCR word-confidence scoring with review gates for uncertain or similar character names
+- Persistent HUD opacity, size, lock state, and last screen position stored in SQLite
 - Responsive navigation, cards, and spacing for narrow in-game layouts
 - Borderless transparent in-game window with a custom drag region
 - Native transparency enabled at window creation and custom borderless resize grip
@@ -70,6 +76,17 @@ Path of Building is optional. For an entirely in-app workflow, open **Character*
 Once any character data is captured, select **Analyze with Ollama** for a local review. Enable **Automatically ask Ollama after a successful screenshot read** if you want the review to run immediately after OCR. The app sends the captured snapshot only to the locally configured Ollama endpoint; no PoE API key is needed.
 
 Use the **Active character** selector to move between saved profiles or **New character** to create one manually. Equipment, sheet values, passive links, Ollama reviews, and snapshots are kept separate. If a screenshot does not visibly contain a recognizable character name, its sheet values are applied to the currently selected profile and the app says so in the OCR status.
+
+## In-game HUD
+
+Select **In-game HUD** or enable automatic HUD opening in Settings. The HUD stays compact and has four local tabs:
+
+- **Assistant** — local Ollama shortcuts, latest answer, and an exact summary of the supplied local context.
+- **Character** — active profile, OCR capture/review, captured defenses, freshness, equipment count, and the latest copied-item comparison.
+- **Events** — session and current-area timers, counters, structured trade cards, and recent `Client.txt` activity.
+- **HUD** — opacity, position/size locking, extra-compact mode, local data-source summary, and taskbar hiding.
+
+Press `F10` while the companion has keyboard focus to toggle the HUD, or `Escape` to leave it. The HUD remembers its last position when exited. It never reads game memory or sends input to Path of Exile. Values labelled “captured” come from the most recent screenshot or clipboard action and are not live combat telemetry.
 
 Screenshot recognition uses the local `tesseract` executable and never uploads images. One-click captures are written to a temporary image and deleted immediately after OCR. The optional folder watcher ignores existing images and processes only new screenshots after they finish saving. On Debian/Ubuntu Tesseract is provided by the `tesseract-ocr` package. If Tesseract is unavailable, the OCR text box remains usable for manually supplied text.
 

@@ -13,6 +13,12 @@ use std::{
     time::Duration,
 };
 
+#[derive(Debug, Clone)]
+pub struct LogUpdate {
+    pub event: GameEvent,
+    pub historical: bool,
+}
+
 pub fn common_log_paths() -> Vec<PathBuf> {
     let mut paths = Vec::new();
     if let Ok(program_files) = std::env::var("PROGRAMFILES(X86)") {
@@ -30,13 +36,13 @@ pub fn common_log_paths() -> Vec<PathBuf> {
 
 pub fn spawn_tail(
     path: PathBuf,
-    sender: Sender<GameEvent>,
+    sender: Sender<LogUpdate>,
     stop: Arc<AtomicBool>,
 ) -> thread::JoinHandle<Result<()>> {
     thread::spawn(move || tail(&path, sender, stop))
 }
 
-fn tail(path: &Path, sender: Sender<GameEvent>, stop: Arc<AtomicBool>) -> Result<()> {
+fn tail(path: &Path, sender: Sender<LogUpdate>, stop: Arc<AtomicBool>) -> Result<()> {
     let file = File::open(path).with_context(|| format!("could not open {}", path.display()))?;
     let mut reader = BufReader::new(file);
     let file_len = reader.get_ref().metadata()?.len();
@@ -53,7 +59,8 @@ fn tail(path: &Path, sender: Sender<GameEvent>, stop: Arc<AtomicBool>) -> Result
             continue;
         }
         if let Some(event) = parse_client_line(&line) {
-            if sender.send(event).is_err() {
+            let historical = reader.stream_position()? <= file_len;
+            if sender.send(LogUpdate { event, historical }).is_err() {
                 break;
             }
         }
