@@ -5,10 +5,43 @@ use std::path::Path;
 
 pub struct EventStore(Connection);
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CharacterSnapshotRecord {
+    pub id: i64,
+    pub captured_at: String,
+    pub label: String,
+    pub data: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CharacterProfileRecord {
+    pub profile_id: String,
+    pub data: String,
+}
+
 impl EventStore {
     pub fn open(path: &Path) -> Result<Self> {
         let connection = Connection::open(path)?;
-        connection.execute_batch("PRAGMA journal_mode=WAL; CREATE TABLE IF NOT EXISTS events (id INTEGER PRIMARY KEY, occurred_at TEXT NOT NULL, kind TEXT NOT NULL, message TEXT NOT NULL);")?;
+        connection.execute_batch(
+            "PRAGMA journal_mode=WAL;
+             CREATE TABLE IF NOT EXISTS events (
+                id INTEGER PRIMARY KEY,
+                occurred_at TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                message TEXT NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS character_snapshots (
+                id INTEGER PRIMARY KEY,
+                captured_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                label TEXT NOT NULL,
+                data TEXT NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS character_profiles (
+                profile_id TEXT PRIMARY KEY,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                data TEXT NOT NULL
+             );",
+        )?;
         Ok(Self(connection))
     }
 
@@ -22,5 +55,95 @@ impl EventStore {
             ],
         )?;
         Ok(())
+    }
+
+    pub fn record_character_snapshot(&self, label: &str, data: &str) -> Result<i64> {
+        self.0.execute(
+            "INSERT INTO character_snapshots (label, data) VALUES (?1, ?2)",
+            params![label, data],
+        )?;
+        Ok(self.0.last_insert_rowid())
+    }
+
+    pub fn character_snapshots(&self, limit: usize) -> Result<Vec<CharacterSnapshotRecord>> {
+        let mut statement = self.0.prepare(
+            "SELECT id, captured_at, label, data
+             FROM character_snapshots
+             ORDER BY id DESC
+             LIMIT ?1",
+        )?;
+        let rows = statement.query_map([limit.min(100) as i64], |row| {
+            Ok(CharacterSnapshotRecord {
+                id: row.get(0)?,
+                captured_at: row.get(1)?,
+                label: row.get(2)?,
+                data: row.get(3)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn save_character_profile(&self, profile_id: &str, data: &str) -> Result<()> {
+        self.0.execute(
+            "INSERT INTO character_profiles (profile_id, data)
+             VALUES (?1, ?2)
+             ON CONFLICT(profile_id) DO UPDATE SET
+                data = excluded.data,
+                updated_at = CURRENT_TIMESTAMP",
+            params![profile_id, data],
+        )?;
+        Ok(())
+    }
+
+    pub fn character_profiles(&self) -> Result<Vec<CharacterProfileRecord>> {
+        let mut statement = self.0.prepare(
+            "SELECT profile_id, data
+             FROM character_profiles
+             ORDER BY updated_at DESC, profile_id",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok(CharacterProfileRecord {
+                profile_id: row.get(0)?,
+                data: row.get(1)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stores_and_loads_character_snapshots() {
+        let store = EventStore::open(Path::new(":memory:")).unwrap();
+        let id = store
+            .record_character_snapshot("Level 90 Witch", r#"{"level":90}"#)
+            .unwrap();
+        let snapshots = store.character_snapshots(10).unwrap();
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(snapshots[0].id, id);
+        assert_eq!(snapshots[0].label, "Level 90 Witch");
+        assert_eq!(snapshots[0].data, r#"{"level":90}"#);
+    }
+
+    #[test]
+    fn upserts_character_profiles() {
+        let store = EventStore::open(Path::new(":memory:")).unwrap();
+        store
+            .save_character_profile("local-1", r#"{"name":"First"}"#)
+            .unwrap();
+        store
+            .save_character_profile("local-1", r#"{"name":"Updated"}"#)
+            .unwrap();
+        store
+            .save_character_profile("local-2", r#"{"name":"Second"}"#)
+            .unwrap();
+        let profiles = store.character_profiles().unwrap();
+        assert_eq!(profiles.len(), 2);
+        assert!(profiles.iter().any(|profile| {
+            profile.profile_id == "local-1" && profile.data.contains("Updated")
+        }));
     }
 }

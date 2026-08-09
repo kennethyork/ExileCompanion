@@ -6,10 +6,14 @@ license.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+arboard.workspace = true
 eframe.workspace = true
 poe-ai = { path = "../poe-ai" }
+poe-character = { path = "../poe-character" }
 poe-core = { path = "../poe-core" }
 poe-logs = { path = "../poe-logs" }
 poe-platform = { path = "../poe-platform" }
+poe-pob = { path = "../poe-pob" }
 poe-storage = { path = "../poe-storage" }
 rfd.workspace = true
+serde_json.workspace = true

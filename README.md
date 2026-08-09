@@ -10,19 +10,31 @@ A native Windows/Linux Path of Exile companion written in Rust. The project is i
 - Proton-safe detection of truncated Path of Exile process names
 - Optional automatic monitoring when the game starts
 - Automatic log connection even when the companion starts before or after the game
-- Compact always-on-top assistant overlay for borderless-windowed gameplay
+- Compact always-on-top in-game HUD for borderless-windowed gameplay that avoids covering the game
 - Automatic overlay entry when PoE starts and dashboard restoration when it closes
-- Full resizable always-on-top in-game interface with optional compact mode
+- Full pages open in the normal app instead of expanding over the game
+- In-game Assistant, Character, and Events tabs with one-click OCR capture and character review
+- Active-character selector, live PoE/log indicators, session counters, and an explicit Exit control
 - Responsive navigation, cards, and spacing for narrow in-game layouts
 - Borderless transparent in-game window with a custom drag region
 - Native transparency enabled at window creation and custom borderless resize grip
 - Translucent glass text surfaces prevent game and companion labels from visually colliding
-- Explicit interactive hit surface prevents compositor click-through in full in-game mode
-- Persistent full-app move handle and large immediate-press resize control
+- Explicit interactive hit surface prevents compositor click-through in the in-game HUD
 - Area, level-up, death, trade-whisper, and chat event parsing
 - Immediate replay of the most recent 256 KiB of log history on connection
 - Local SQLite event history
-- Optional local Ollama assistant grounded in the last 30 parsed log events
+- Local Path of Building export-code and XML import with character stats, skills, and equipment
+- Imported build snapshots remain available alongside live `Client.txt` session information
+- Fully local character capture without PoE credentials or Path of Building
+- Persistent multi-character roster with automatic OCR name matching and profile switching
+- OCR recognition for visible name, level, class/ascendancy, league, and character-sheet totals
+- User-triggered equipped-item clipboard parsing with recognized bonus totals
+- One-click, user-triggered screen capture with local character-sheet OCR
+- Optional screenshot-folder watcher and editable OCR text import
+- Official passive-tree URL validation and allocation inspection
+- SQLite character snapshot history with load and comparison controls
+- Optional local Ollama assistant grounded in captured character data and the last 30 parsed log events
+- One-click character review and optional automatic analysis after screenshot OCR
 - Ollama thinking disabled, warm model retention, and explicit stale-knowledge safeguards
 - Session counters and recent-event feed
 - Explicit policy boundary: no game-input, memory-reading, packet, or unattended automation modules
@@ -38,12 +50,28 @@ cargo run -p poe-app
 For the local assistant, start Ollama and install the default model:
 
 ```bash
-ollama pull qwen3:1.7b
+ollama pull qwen3.5:2b
 ```
 
 On Linux, eframe may require the normal X11/Wayland development packages supplied by your distribution. The database is saved under the platform data directory when available, otherwise beside the executable.
 
 The app initially guesses common log paths. Use **Select Client.txt** to choose the correct file. For Steam/Proton this is typically inside the relevant Steam compatibility prefix.
+
+To load character information without an API key, open **Character** and either use the fully in-app capture workflow or, optionally, paste a Path of Building export code/select a saved PoB XML file. Web build links are not downloaded. Imports are parsed locally and do not disable `Client.txt` monitoring.
+
+Path of Building is optional. For an entirely in-app workflow, open **Character** and:
+
+1. Capture a screen where the character name/level header is visible. OCR selects the matching saved character or creates a new profile automatically; identity fields remain editable if OCR needs correction.
+2. Hover each equipped item in PoE, press `Ctrl+C`, select its slot, and use **Read clipboard and capture**.
+3. Open the in-game character sheet and click **Capture screen and read**, select an existing screenshot, or paste/edit OCR text manually.
+4. Paste an official `pathofexile.com` passive-tree URL.
+5. Save local snapshots to compare the captured character later.
+
+Once any character data is captured, select **Analyze with Ollama** for a local review. Enable **Automatically ask Ollama after a successful screenshot read** if you want the review to run immediately after OCR. The app sends the captured snapshot only to the locally configured Ollama endpoint; no PoE API key is needed.
+
+Use the **Active character** selector to move between saved profiles or **New character** to create one manually. Equipment, sheet values, passive links, Ollama reviews, and snapshots are kept separate. If a screenshot does not visibly contain a recognizable character name, its sheet values are applied to the currently selected profile and the app says so in the OCR status.
+
+Screenshot recognition uses the local `tesseract` executable and never uploads images. One-click captures are written to a temporary image and deleted immediately after OCR. The optional folder watcher ignores existing images and processes only new screenshots after they finish saving. On Debian/Ubuntu Tesseract is provided by the `tesseract-ocr` package. If Tesseract is unavailable, the OCR text box remains usable for manually supplied text.
 
 ## Test
 
