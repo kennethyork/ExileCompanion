@@ -1,0 +1,45 @@
+name: Build release packages
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            format: appimage
+            artifact: exile-companion-linux
+            package_glob: target/release/*.AppImage
+          - os: windows-latest
+            format: nsis
+            artifact: exile-companion-windows
+            package_glob: target/release/*-setup.exe
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libx11-dev libxi-dev libgl1-mesa-dev libgtk-3-dev libfuse2
+      - name: Test workspace
+        run: cargo test --workspace --locked
+      - name: Install cargo-packager
+        run: cargo install cargo-packager --locked
+      - name: Build package
+        working-directory: crates/poe-app
+        run: cargo packager --release --formats ${{ matrix.format }}
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.package_glob }}
+          if-no-files-found: error

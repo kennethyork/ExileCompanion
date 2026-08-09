@@ -1,11 +1,12 @@
 use anyhow::Result;
 use poe_core::GameEvent;
 use rusqlite::{params, Connection};
+use serde::{Deserialize, Serialize};
 use std::path::Path;
 
 pub struct EventStore(Connection);
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CharacterSnapshotRecord {
     pub id: i64,
     pub captured_at: String,
@@ -19,7 +20,7 @@ pub struct CharacterProfileRecord {
     pub data: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MapRunRecord {
     pub captured_at: String,
     pub area: String,
@@ -152,9 +153,10 @@ impl EventStore {
 
     pub fn record_map_run(&self, run: &MapRunRecord) -> Result<()> {
         self.0.execute(
-            "INSERT INTO map_runs (area, duration_seconds, deaths, investment, loot)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
+            "INSERT INTO map_runs (captured_at, area, duration_seconds, deaths, investment, loot)
+             VALUES (CASE WHEN ?1 = '' THEN CURRENT_TIMESTAMP ELSE ?1 END, ?2, ?3, ?4, ?5, ?6)",
             params![
+                &run.captured_at,
                 &run.area,
                 run.duration_seconds,
                 run.deaths,
@@ -170,7 +172,7 @@ impl EventStore {
             "SELECT captured_at, area, duration_seconds, deaths, investment, loot
              FROM map_runs ORDER BY id DESC LIMIT ?1",
         )?;
-        let rows = statement.query_map([limit.min(100) as i64], |row| {
+        let rows = statement.query_map([limit.min(10_000) as i64], |row| {
             Ok(MapRunRecord {
                 captured_at: row.get(0)?,
                 area: row.get(1)?,

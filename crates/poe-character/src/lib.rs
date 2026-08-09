@@ -59,6 +59,16 @@ pub struct CapturedGem {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CaptureFreshness {
+    pub identity_at: Option<i64>,
+    pub equipment_at: Option<i64>,
+    pub gems_at: Option<i64>,
+    pub sheet_at: Option<i64>,
+    pub passives_at: Option<i64>,
+    pub sheet_confidence: Option<u8>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OfflineCharacter {
     #[serde(default)]
     pub profile_id: String,
@@ -72,6 +82,8 @@ pub struct OfflineCharacter {
     pub items: Vec<CapturedItem>,
     #[serde(default)]
     pub gems: Vec<CapturedGem>,
+    #[serde(default)]
+    pub freshness: CaptureFreshness,
     #[serde(default)]
     pub ollama_review: String,
 }
@@ -161,6 +173,7 @@ pub struct LocalBuildAssessment {
     pub resistance_gaps: Vec<String>,
     pub warnings: Vec<String>,
     pub gem_groups: usize,
+    pub coverage: Vec<(String, bool)>,
 }
 
 pub fn parse_item_text(slot: &str, input: &str) -> Result<CapturedItem> {
@@ -305,12 +318,62 @@ pub fn assess_character(character: &OfflineCharacter) -> LocalBuildAssessment {
     if character.passive_tree_url.is_empty() {
         warnings.push("Passive tree is missing".into());
     }
+    if let Some(chaos) = sheet_number(character, "Chaos Resistance") {
+        if chaos < 0 {
+            warnings.push(format!("Chaos Resistance is negative ({chaos}%)"));
+        }
+    } else {
+        warnings.push("Chaos Resistance is not captured".into());
+    }
     let gem_groups = character
         .gems
         .iter()
         .map(|gem| gem.group.to_ascii_lowercase())
         .collect::<std::collections::BTreeSet<_>>()
         .len();
+    let gem_names = character
+        .gems
+        .iter()
+        .map(|gem| gem.name.to_ascii_lowercase())
+        .collect::<Vec<_>>();
+    let gem_tags = character
+        .gems
+        .iter()
+        .flat_map(|gem| gem.tags.iter().map(|tag| tag.to_ascii_lowercase()))
+        .collect::<Vec<_>>();
+    let has_name = |needles: &[&str]| {
+        gem_names
+            .iter()
+            .any(|name| needles.iter().any(|needle| name.contains(needle)))
+    };
+    let coverage = vec![
+        (
+            "Movement skill".into(),
+            gem_tags.iter().any(|tag| tag == "movement"),
+        ),
+        (
+            "Guard skill".into(),
+            has_name(&[
+                "molten shell",
+                "steelskin",
+                "immortal call",
+                "arcane cloak",
+                "frost shield",
+            ]),
+        ),
+        (
+            "Aura or reservation skill".into(),
+            gem_tags
+                .iter()
+                .any(|tag| tag == "aura" || tag == "reservation"),
+        ),
+        (
+            "Curse or mark".into(),
+            gem_tags
+                .iter()
+                .any(|tag| tag == "curse" || tag == "hex" || tag == "mark"),
+        ),
+    ];
     LocalBuildAssessment {
         captured_life,
         captured_energy_shield,
@@ -318,6 +381,7 @@ pub fn assess_character(character: &OfflineCharacter) -> LocalBuildAssessment {
         resistance_gaps,
         warnings,
         gem_groups,
+        coverage,
     }
 }
 

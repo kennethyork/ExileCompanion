@@ -7,6 +7,7 @@ license.workspace = true
 [dependencies]
 anyhow.workspace = true
 arboard.workspace = true
+chrono.workspace = true
 eframe.workspace = true
 image.workspace = true
 poe-ai = { path = "../poe-ai" }
@@ -17,4 +18,15 @@ poe-platform = { path = "../poe-platform" }
 poe-pob = { path = "../poe-pob" }
 poe-storage = { path = "../poe-storage" }
 rfd.workspace = true
+serde.workspace = true
 serde_json.workspace = true
+
+[package.metadata.packager]
+product-name = "Exile Companion"
+identifier = "com.kennethyork.exilecompanion"
+category = "Utility"
+description = "A local-first Path of Exile 1 companion"
+long-description = "Local character capture, Client.txt session tools, map analysis, and optional localhost-only Ollama assistance. This product is not affiliated with or endorsed by Grinding Gear Games."
+icons = ["assets/icon.png"]
+before-packaging-command = "cargo build --release -p poe-app"
+binaries = [{ path = "poe-app", main = true }]

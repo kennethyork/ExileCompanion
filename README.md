@@ -50,6 +50,13 @@ A native Windows/Linux Path of Exile companion written in Rust. The project is i
 - Character progression checklist and passive-tree allocation ID inspection
 - Local loot-filter editor, structural checks, and `.filter` export
 - Full-screen, center-panel, and top-center OCR crop presets for more reliable capture
+- Guided five-source Capture Center with persisted timestamps and OCR confidence per character
+- Custom percentage-based OCR crop calibration with a local image preview
+- Optional local passive-tree JSON loading to resolve allocated node IDs into names
+- Map-run averages, deathless rate, complete local history, and CSV export
+- Complete JSON backup/merge restore for characters, snapshots, map runs, planners, filters, and crop settings
+- First-run diagnostics for Client.txt, SQLite, Tesseract, screenshot folders, and optional Ollama
+- Local panic log viewer and version information
 - Session counters and recent-event feed
 - Explicit policy boundary: no game-input, memory-reading, packet, or unattended automation modules
 
@@ -105,6 +112,14 @@ Open **Tools** for the map-mod checker, crafting worksheet, map-run journal, pro
 
 The build assessment and upgrade comparison deliberately use only values the app actually captured. They do not reproduce Path of Building's combat simulation, infer hidden passive effects, download current affix/price data, or claim exact DPS from incomplete screenshots. This keeps the no-login workflow private and makes uncertain data visible instead of fabricating precision.
 
+The progression review also checks captured gems for movement, guard, aura/reservation, and curse/mark coverage. These checks report only what has been captured; an absent result means “not observed,” not necessarily that the live character lacks it.
+
+## Backup and release packages
+
+Use **Settings → Backup and restore** to export a readable local JSON backup or merge one into the current installation. Settings also contains setup diagnostics and any locally written panic log.
+
+Tagged releases and manually dispatched GitHub Actions build a Linux AppImage and a Windows NSIS installer with `cargo-packager`. The workflow runs the complete test suite before packaging.
+
 ## Test
 
 ```bash
@@ -122,3 +137,5 @@ This application does not send input to Path of Exile. New features must fit one
 - display-only overlays and notifications.
 
 Before distributing new integrations, verify them against the current Grinding Gear Games Terms of Use and developer policies.
+
+This product isn't affiliated with or endorsed by Grinding Gear Games in any way.
