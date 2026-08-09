@@ -49,6 +49,16 @@ pub struct CapturedItem {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CapturedGem {
+    pub group: String,
+    pub name: String,
+    pub level: u32,
+    pub quality: i32,
+    pub tags: Vec<String>,
+    pub raw_text: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OfflineCharacter {
     #[serde(default)]
     pub profile_id: String,
@@ -60,6 +70,8 @@ pub struct OfflineCharacter {
     pub passive_tree_url: String,
     pub sheet_stats: BTreeMap<String, String>,
     pub items: Vec<CapturedItem>,
+    #[serde(default)]
+    pub gems: Vec<CapturedGem>,
     #[serde(default)]
     pub ollama_review: String,
 }
@@ -113,7 +125,18 @@ impl OfflineCharacter {
             .map(|item| format!("{}: {}", item.slot, item.name))
             .collect::<Vec<_>>()
             .join(", ");
-        format!("{identity}\nCharacter sheet: {stats}\nEquipment: {items}")
+        let gems = self
+            .gems
+            .iter()
+            .map(|gem| {
+                format!(
+                    "{}: {} (level {}, quality {:+}%)",
+                    gem.group, gem.name, gem.level, gem.quality
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("{identity}\nCharacter sheet: {stats}\nEquipment: {items}\nCaptured gems: {gems}")
     }
 }
 
@@ -126,6 +149,18 @@ pub struct PassiveTreeInfo {
     pub allocated_nodes: usize,
     pub extended_nodes: usize,
     pub masteries: usize,
+    pub allocated_node_ids: Vec<u16>,
+    pub extended_node_ids: Vec<u16>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LocalBuildAssessment {
+    pub captured_life: Option<i32>,
+    pub captured_energy_shield: Option<i32>,
+    pub raw_life_es_pool: Option<i32>,
+    pub resistance_gaps: Vec<String>,
+    pub warnings: Vec<String>,
+    pub gem_groups: usize,
 }
 
 pub fn parse_item_text(slot: &str, input: &str) -> Result<CapturedItem> {
@@ -197,6 +232,93 @@ pub fn parse_item_text(slot: &str, input: &str) -> Result<CapturedItem> {
         bonuses,
         raw_text: text.to_string(),
     })
+}
+
+pub fn parse_gem_text(group: &str, input: &str) -> Result<CapturedGem> {
+    let text = input.trim();
+    if text.is_empty() {
+        bail!("copy a skill or support gem in Path of Exile first");
+    }
+    let lines = text.lines().map(str::trim).collect::<Vec<_>>();
+    let rarity_index = lines
+        .iter()
+        .position(|line| line.starts_with("Rarity:"))
+        .context("this does not look like copied Path of Exile gem text")?;
+    let name = lines
+        .get(rarity_index + 1)
+        .filter(|line| !line.is_empty() && **line != "--------")
+        .context("gem name is missing")?
+        .to_string();
+    let level = prefixed_value(&lines, "Level:")
+        .and_then(|value| value.split_whitespace().next()?.parse().ok())
+        .unwrap_or(1);
+    let quality = prefixed_value(&lines, "Quality:")
+        .and_then(|value| parse_number(&value))
+        .unwrap_or_default();
+    let tags = lines
+        .iter()
+        .position(|line| *line == "--------")
+        .and_then(|separator| lines.get(separator + 1))
+        .filter(|line| line.contains(','))
+        .map_or_else(Vec::new, |line| {
+            line.split(',').map(|tag| tag.trim().to_string()).collect()
+        });
+    Ok(CapturedGem {
+        group: group.trim().to_string(),
+        name,
+        level,
+        quality,
+        tags,
+        raw_text: text.to_string(),
+    })
+}
+
+pub fn assess_character(character: &OfflineCharacter) -> LocalBuildAssessment {
+    let captured_life = sheet_number(character, "Life");
+    let captured_energy_shield = sheet_number(character, "Energy Shield");
+    let raw_life_es_pool = match (captured_life, captured_energy_shield) {
+        (Some(life), Some(es)) => Some(life + es),
+        (Some(life), None) => Some(life),
+        (None, Some(es)) => Some(es),
+        (None, None) => None,
+    };
+    let mut resistance_gaps = Vec::new();
+    for name in ["Fire Resistance", "Cold Resistance", "Lightning Resistance"] {
+        match sheet_number(character, name) {
+            Some(value) if value < 75 => {
+                resistance_gaps.push(format!("{name}: {}% below 75%", 75 - value))
+            }
+            None => resistance_gaps.push(format!("{name}: not captured")),
+            Some(_) => {}
+        }
+    }
+    let mut warnings = Vec::new();
+    if character.items.len() < 8 {
+        warnings.push(format!(
+            "Only {} equipment slots are captured",
+            character.items.len()
+        ));
+    }
+    if character.gems.is_empty() {
+        warnings.push("No skill gems are captured".into());
+    }
+    if character.passive_tree_url.is_empty() {
+        warnings.push("Passive tree is missing".into());
+    }
+    let gem_groups = character
+        .gems
+        .iter()
+        .map(|gem| gem.group.to_ascii_lowercase())
+        .collect::<std::collections::BTreeSet<_>>()
+        .len();
+    LocalBuildAssessment {
+        captured_life,
+        captured_energy_shield,
+        raw_life_es_pool,
+        resistance_gaps,
+        warnings,
+        gem_groups,
+    }
 }
 
 pub fn parse_character_sheet_text(input: &str) -> Result<BTreeMap<String, String>> {
@@ -301,10 +423,10 @@ pub fn inspect_passive_tree_url(input: &str) -> Result<PassiveTreeInfo> {
     let ascendancy_id = ascendancy_data & 0x03;
     let bloodline_id = ascendancy_data >> 2;
     let mut cursor = 6;
-    let (allocated_nodes, extended_nodes, masteries) = match version {
+    let (allocated_node_ids, extended_node_ids, masteries) = match version {
         6 => {
-            let nodes = read_counted_u16(&bytes, &mut cursor)?;
-            let extended = read_counted_u16(&bytes, &mut cursor)?;
+            let nodes = read_counted_u16_values(&bytes, &mut cursor)?;
+            let extended = read_counted_u16_values(&bytes, &mut cursor)?;
             let mastery_count = read_u8(&bytes, &mut cursor)? as usize;
             let required = mastery_count.saturating_mul(4);
             if bytes.len().saturating_sub(cursor) < required {
@@ -313,11 +435,19 @@ pub fn inspect_passive_tree_url(input: &str) -> Result<PassiveTreeInfo> {
             (nodes, extended, mastery_count)
         }
         5 => (
-            read_counted_u16(&bytes, &mut cursor)?,
-            read_counted_u16(&bytes, &mut cursor)?,
+            read_counted_u16_values(&bytes, &mut cursor)?,
+            read_counted_u16_values(&bytes, &mut cursor)?,
             0,
         ),
-        4 => (bytes.len().saturating_sub(7) / 2, 0, 0),
+        4 => {
+            cursor = 7;
+            let mut nodes = Vec::new();
+            while bytes.len().saturating_sub(cursor) >= 2 {
+                nodes.push(u16::from_be_bytes([bytes[cursor], bytes[cursor + 1]]));
+                cursor += 2;
+            }
+            (nodes, Vec::new(), 0)
+        }
         _ => bail!("unsupported passive-tree format version {version}"),
     };
     Ok(PassiveTreeInfo {
@@ -325,9 +455,11 @@ pub fn inspect_passive_tree_url(input: &str) -> Result<PassiveTreeInfo> {
         class_id,
         ascendancy_id,
         bloodline_id,
-        allocated_nodes,
-        extended_nodes,
+        allocated_nodes: allocated_node_ids.len(),
+        extended_nodes: extended_node_ids.len(),
         masteries,
+        allocated_node_ids,
+        extended_node_ids,
     })
 }
 
@@ -442,14 +574,25 @@ fn read_u8(bytes: &[u8], cursor: &mut usize) -> Result<u8> {
     Ok(value)
 }
 
-fn read_counted_u16(bytes: &[u8], cursor: &mut usize) -> Result<usize> {
+fn read_counted_u16_values(bytes: &[u8], cursor: &mut usize) -> Result<Vec<u16>> {
     let count = read_u8(bytes, cursor)? as usize;
     let required = count.saturating_mul(2);
     if bytes.len().saturating_sub(*cursor) < required {
         bail!("passive-tree node data is incomplete");
     }
+    let values = bytes[*cursor..*cursor + required]
+        .chunks_exact(2)
+        .map(|chunk| u16::from_be_bytes([chunk[0], chunk[1]]))
+        .collect();
     *cursor += required;
-    Ok(count)
+    Ok(values)
+}
+
+fn sheet_number(character: &OfflineCharacter, name: &str) -> Option<i32> {
+    character
+        .sheet_stats
+        .get(name)
+        .and_then(|value| parse_number(value))
 }
 
 fn value_or_unknown(value: &str) -> &str {
@@ -491,6 +634,30 @@ mod tests {
     }
 
     #[test]
+    fn parses_copied_gem_and_assesses_character() {
+        let gem = parse_gem_text(
+            "Main skill",
+            "Item Class: Skill Gems\nRarity: Gem\nFireball\n--------\nSpell, Projectile, Fire\nLevel: 20\nQuality: +20%",
+        )
+        .unwrap();
+        assert_eq!(gem.name, "Fireball");
+        assert_eq!(gem.level, 20);
+        assert_eq!(gem.quality, 20);
+        let mut character = OfflineCharacter::default();
+        character.gems.push(gem);
+        character.sheet_stats.insert("Life".into(), "4,000".into());
+        character
+            .sheet_stats
+            .insert("Fire Resistance".into(), "60%".into());
+        let assessment = assess_character(&character);
+        assert_eq!(assessment.raw_life_es_pool, Some(4000));
+        assert!(assessment
+            .resistance_gaps
+            .iter()
+            .any(|gap| gap.contains("15%")));
+    }
+
+    #[test]
     fn parses_labelled_character_identity() {
         let identity = parse_character_identity_text(
             "Character Name: BoneCollector\nLevel: 94\nAscendancy: Necromancer\nLeague: Settlers",
@@ -526,6 +693,7 @@ mod tests {
         assert_eq!(info.allocated_nodes, 2);
         assert_eq!(info.extended_nodes, 1);
         assert_eq!(info.masteries, 1);
+        assert_eq!(info.allocated_node_ids, vec![0x1234, 0x5678]);
     }
 
     #[test]

@@ -14,6 +14,7 @@ base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
 eframe = "0.31"
 flate2 = "1.1"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 quick-xml = "0.41"
 regex = "1.11"
 rusqlite = { version = "0.33", features = ["bundled"] }

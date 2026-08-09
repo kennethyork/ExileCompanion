@@ -19,6 +19,16 @@ pub struct CharacterProfileRecord {
     pub data: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MapRunRecord {
+    pub captured_at: String,
+    pub area: String,
+    pub duration_seconds: u64,
+    pub deaths: u32,
+    pub investment: String,
+    pub loot: String,
+}
+
 impl EventStore {
     pub fn open(path: &Path) -> Result<Self> {
         let connection = Connection::open(path)?;
@@ -44,6 +54,15 @@ impl EventStore {
              CREATE TABLE IF NOT EXISTS app_preferences (
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS map_runs (
+                id INTEGER PRIMARY KEY,
+                captured_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                area TEXT NOT NULL,
+                duration_seconds INTEGER NOT NULL,
+                deaths INTEGER NOT NULL,
+                investment TEXT NOT NULL,
+                loot TEXT NOT NULL
              );",
         )?;
         Ok(Self(connection))
@@ -130,6 +149,39 @@ impl EventStore {
         let mut rows = statement.query([key])?;
         Ok(rows.next()?.map(|row| row.get(0)).transpose()?)
     }
+
+    pub fn record_map_run(&self, run: &MapRunRecord) -> Result<()> {
+        self.0.execute(
+            "INSERT INTO map_runs (area, duration_seconds, deaths, investment, loot)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                &run.area,
+                run.duration_seconds,
+                run.deaths,
+                &run.investment,
+                &run.loot
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn map_runs(&self, limit: usize) -> Result<Vec<MapRunRecord>> {
+        let mut statement = self.0.prepare(
+            "SELECT captured_at, area, duration_seconds, deaths, investment, loot
+             FROM map_runs ORDER BY id DESC LIMIT ?1",
+        )?;
+        let rows = statement.query_map([limit.min(100) as i64], |row| {
+            Ok(MapRunRecord {
+                captured_at: row.get(0)?,
+                area: row.get(1)?,
+                duration_seconds: row.get(2)?,
+                deaths: row.get(3)?,
+                investment: row.get(4)?,
+                loot: row.get(5)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
 }
 
 #[cfg(test)]
@@ -177,5 +229,23 @@ mod tests {
             store.preference("hud.opacity").unwrap().as_deref(),
             Some("0.85")
         );
+    }
+
+    #[test]
+    fn stores_map_runs() {
+        let store = EventStore::open(Path::new(":memory:")).unwrap();
+        store
+            .record_map_run(&MapRunRecord {
+                captured_at: String::new(),
+                area: "Dunes".into(),
+                duration_seconds: 123,
+                deaths: 1,
+                investment: "4 chaos".into(),
+                loot: "12 chaos".into(),
+            })
+            .unwrap();
+        let runs = store.map_runs(10).unwrap();
+        assert_eq!(runs[0].area, "Dunes");
+        assert_eq!(runs[0].duration_seconds, 123);
     }
 }

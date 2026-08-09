@@ -1764,6 +1764,8 @@ dependencies = [
  "num-traits",
  "png",
  "tiff",
+ "zune-core",
+ "zune-jpeg",
 ]
 
 [[package]]
@@ -2630,6 +2632,7 @@ dependencies = [
  "anyhow",
  "arboard",
  "eframe",
+ "image",
  "poe-ai",
  "poe-character",
  "poe-core",

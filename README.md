@@ -42,6 +42,14 @@ A native Windows/Linux Path of Exile companion written in Rust. The project is i
 - Optional local Ollama assistant grounded in captured character data and the last 30 parsed log events
 - One-click character review and optional automatic analysis after screenshot OCR
 - Ollama thinking disabled, warm model retention, and explicit stale-knowledge safeguards
+- Captured gem/link-group roster with level, quality, and tags included in local Ollama context
+- Transparent local build assessment for captured Life/ES, resistance gaps, gem groups, and missing data
+- Map-mod OCR with an editable local danger-phrase list
+- SQLite map-run journal with duration, deaths, investment notes, and loot notes
+- Local crafting worksheet based on copied item text, with explicit limits where affix data is unavailable
+- Character progression checklist and passive-tree allocation ID inspection
+- Local loot-filter editor, structural checks, and `.filter` export
+- Full-screen, center-panel, and top-center OCR crop presets for more reliable capture
 - Session counters and recent-event feed
 - Explicit policy boundary: no game-input, memory-reading, packet, or unattended automation modules
 
@@ -69,9 +77,10 @@ Path of Building is optional. For an entirely in-app workflow, open **Character*
 
 1. Capture a screen where the character name/level header is visible. OCR selects the matching saved character or creates a new profile automatically; identity fields remain editable if OCR needs correction.
 2. Hover each equipped item in PoE, press `Ctrl+C`, select its slot, and use **Read clipboard and capture**.
-3. Open the in-game character sheet and click **Capture screen and read**, select an existing screenshot, or paste/edit OCR text manually.
-4. Paste an official `pathofexile.com` passive-tree URL.
-5. Save local snapshots to compare the captured character later.
+3. Copy each active/support gem and assign the same group label to gems linked together.
+4. Open the in-game character sheet and click **Capture screen and read**, select an existing screenshot, or paste/edit OCR text manually. Choose the crop preset that best contains the visible panel.
+5. Paste an official `pathofexile.com` passive-tree URL to inspect its encoded class and allocated node IDs locally.
+6. Save local snapshots to compare the captured character later.
 
 Once any character data is captured, select **Analyze with Ollama** for a local review. Enable **Automatically ask Ollama after a successful screenshot read** if you want the review to run immediately after OCR. The app sends the captured snapshot only to the locally configured Ollama endpoint; no PoE API key is needed.
 
@@ -89,6 +98,12 @@ Select **In-game HUD** or enable automatic HUD opening in Settings. The HUD stay
 Press `F10` while the companion has keyboard focus to toggle the HUD, or `Escape` to leave it. The HUD remembers its last position when exited. It never reads game memory or sends input to Path of Exile. Values labelled “captured” come from the most recent screenshot or clipboard action and are not live combat telemetry.
 
 Screenshot recognition uses the local `tesseract` executable and never uploads images. One-click captures are written to a temporary image and deleted immediately after OCR. The optional folder watcher ignores existing images and processes only new screenshots after they finish saving. On Debian/Ubuntu Tesseract is provided by the `tesseract-ocr` package. If Tesseract is unavailable, the OCR text box remains usable for manually supplied text.
+
+## Local competitive toolkit
+
+Open **Tools** for the map-mod checker, crafting worksheet, map-run journal, progression checklist, and loot-filter editor. The map checker can capture the top-center of the game screen with the same local OCR pipeline used by character capture. Risk phrases, craft notes, and filter text are kept in the local SQLite preferences; completed map runs are stored in their own local table.
+
+The build assessment and upgrade comparison deliberately use only values the app actually captured. They do not reproduce Path of Building's combat simulation, infer hidden passive effects, download current affix/price data, or claim exact DPS from incomplete screenshots. This keeps the no-login workflow private and makes uncertain data visible instead of fabricating precision.
 
 ## Test
 

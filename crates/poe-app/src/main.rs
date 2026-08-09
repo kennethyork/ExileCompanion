@@ -1,14 +1,15 @@
 use eframe::egui::{self, Color32, RichText, Stroke};
 use poe_ai::{ChatMessage, OllamaClient};
 use poe_character::{
-    inspect_passive_tree_url, parse_character_identity_text, parse_character_sheet_text,
-    parse_item_text, CapturedItem, DetectedCharacterIdentity, OfflineCharacter,
+    assess_character, inspect_passive_tree_url, parse_character_identity_text,
+    parse_character_sheet_text, parse_gem_text, parse_item_text, CapturedItem,
+    DetectedCharacterIdentity, OfflineCharacter,
 };
 use poe_core::{parse_trade_request, EventKind, GameEvent, SessionStats, TradeRequest};
 use poe_logs::{spawn_tail, LogUpdate};
 use poe_platform::{discover_client_log, is_poe_running};
 use poe_pob::PobBuild;
-use poe_storage::{CharacterSnapshotRecord, EventStore};
+use poe_storage::{CharacterSnapshotRecord, EventStore, MapRunRecord};
 use std::{
     collections::{HashSet, VecDeque},
     path::PathBuf,
@@ -131,6 +132,23 @@ enum CompactPanel {
     Settings,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CaptureRegion {
+    FullScreen,
+    CenterPanel,
+    TopCenter,
+}
+
+impl CaptureRegion {
+    fn label(self) -> &'static str {
+        match self {
+            Self::FullScreen => "Full screen",
+            Self::CenterPanel => "Center panel",
+            Self::TopCenter => "Top-center/map mods",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct OcrResult {
     text: String,
@@ -169,6 +187,8 @@ struct CompanionApp {
     ocr_confidence: Option<f32>,
     ocr_needs_review: bool,
     last_character_capture: Option<std::time::Instant>,
+    capture_region: CaptureRegion,
+    ocr_for_map_mods: bool,
     restore_after_ocr: bool,
     auto_analyze_character: bool,
     character_analysis_pending: bool,
@@ -200,10 +220,25 @@ struct CompanionApp {
     area_entered_at: Option<std::time::Instant>,
     session_started_at: std::time::Instant,
     item_comparison: String,
+    gem_group: String,
+    gem_input: String,
+    gem_status: String,
     hud_opacity: f32,
     hud_locked: bool,
     hud_extra_compact: bool,
     hud_position: Option<egui::Pos2>,
+    map_mod_input: String,
+    map_risk_rules: String,
+    map_mod_status: String,
+    crafting_input: String,
+    crafting_plan: String,
+    loot_filter_text: String,
+    loot_filter_status: String,
+    active_map_started: Option<std::time::Instant>,
+    active_map_deaths: u32,
+    map_investment: String,
+    map_loot: String,
+    map_runs: Vec<MapRunRecord>,
 }
 
 impl CompanionApp {
@@ -248,6 +283,21 @@ impl CompanionApp {
         let hud_position = stored_f32(&store, "hud.x")
             .zip(stored_f32(&store, "hud.y"))
             .map(|(x, y)| egui::pos2(x, y));
+        let map_risk_rules = stored_text(
+            &store,
+            "planner.map_risks",
+            "reflect\ncannot regenerate\nreduced recovery\nmaximum resistances",
+        );
+        let crafting_plan = stored_text(&store, "planner.crafting", "");
+        let loot_filter_text = stored_text(
+            &store,
+            "planner.loot_filter",
+            "Show\n  Rarity >= Rare\n  SetBorderColor 255 180 0\n\nHide\n  Rarity Normal",
+        );
+        let map_runs = store
+            .as_ref()
+            .and_then(|store| store.map_runs(20).ok())
+            .unwrap_or_default();
         Self {
             page: Page::Dashboard,
             filter: EventFilter::All,
@@ -274,6 +324,8 @@ impl CompanionApp {
             ocr_confidence: None,
             ocr_needs_review: false,
             last_character_capture: None,
+            capture_region: CaptureRegion::CenterPanel,
+            ocr_for_map_mods: false,
             restore_after_ocr: false,
             auto_analyze_character: false,
             character_analysis_pending: false,
@@ -307,10 +359,25 @@ impl CompanionApp {
             area_entered_at: None,
             session_started_at: std::time::Instant::now(),
             item_comparison: String::new(),
+            gem_group: "Main skill".into(),
+            gem_input: String::new(),
+            gem_status: "Copy a gem in PoE, then capture it into a link group".into(),
             hud_opacity,
             hud_locked,
             hud_extra_compact,
             hud_position,
+            map_mod_input: String::new(),
+            map_risk_rules,
+            map_mod_status: "Paste or OCR map modifiers to check local risk rules".into(),
+            crafting_input: String::new(),
+            crafting_plan,
+            loot_filter_text,
+            loot_filter_status: "Edit and validate a local filter".into(),
+            active_map_started: None,
+            active_map_deaths: 0,
+            map_investment: String::new(),
+            map_loot: String::new(),
+            map_runs,
         }
     }
 
@@ -346,6 +413,85 @@ impl CompanionApp {
             egui::vec2(460.0, 420.0)
         };
         ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
+    }
+
+    fn save_planner_text(&self, key: &str, value: &str) {
+        if let Some(store) = &self.store {
+            let _ = store.set_preference(key, value);
+        }
+    }
+
+    fn analyze_map_mods(&mut self) {
+        let risks = find_map_risks(&self.map_mod_input, &self.map_risk_rules);
+        self.map_mod_status = if risks.is_empty() {
+            "No configured risk phrases matched; review the text manually".into()
+        } else {
+            format!("DANGER · {}", risks.join(" · "))
+        };
+    }
+
+    fn analyze_crafting_item(&mut self) {
+        self.crafting_plan = crafting_summary(&self.crafting_input);
+        let value = self.crafting_plan.clone();
+        self.save_planner_text("planner.crafting", &value);
+    }
+
+    fn validate_loot_filter(&mut self) {
+        self.loot_filter_status = validate_loot_filter(&self.loot_filter_text);
+        let value = self.loot_filter_text.clone();
+        self.save_planner_text("planner.loot_filter", &value);
+    }
+
+    fn start_map_run(&mut self) {
+        self.active_map_started = Some(std::time::Instant::now());
+        self.active_map_deaths = self.stats.deaths;
+        self.push_hud_alert(
+            format!(
+                "Map run started: {}",
+                if self.current_area.is_empty() {
+                    "unknown area"
+                } else {
+                    &self.current_area
+                }
+            ),
+            false,
+        );
+    }
+
+    fn finish_map_run(&mut self) {
+        let Some(started) = self.active_map_started.take() else {
+            self.push_hud_alert("Start a map run first", true);
+            return;
+        };
+        let run = MapRunRecord {
+            captured_at: String::new(),
+            area: if self.current_area.is_empty() {
+                "Unknown area".into()
+            } else {
+                self.current_area.clone()
+            },
+            duration_seconds: started.elapsed().as_secs(),
+            deaths: self.stats.deaths.saturating_sub(self.active_map_deaths),
+            investment: self.map_investment.clone(),
+            loot: self.map_loot.clone(),
+        };
+        if let Some(store) = &self.store {
+            if let Err(error) = store.record_map_run(&run) {
+                self.push_hud_alert(format!("Could not save map run: {error}"), true);
+                return;
+            }
+            self.map_runs = store.map_runs(20).unwrap_or_default();
+        }
+        self.push_hud_alert(
+            format!(
+                "Saved {} run · {}",
+                run.area,
+                format_duration(std::time::Duration::from_secs(run.duration_seconds))
+            ),
+            false,
+        );
+        self.map_investment.clear();
+        self.map_loot.clear();
     }
 
     fn persist_current_character(&mut self) {
@@ -519,11 +665,38 @@ impl CompanionApp {
         }
     }
 
+    fn capture_gem(&mut self) {
+        match parse_gem_text(&self.gem_group, &self.gem_input) {
+            Ok(gem) => {
+                let name = gem.name.clone();
+                self.offline_character.gems.retain(|existing| {
+                    !(existing.group.eq_ignore_ascii_case(&gem.group)
+                        && existing.name.eq_ignore_ascii_case(&gem.name))
+                });
+                self.offline_character.gems.push(gem);
+                self.gem_status = format!("Captured {name} in {}", self.gem_group);
+                self.gem_input.clear();
+                self.persist_current_character();
+            }
+            Err(error) => self.gem_status = error.to_string(),
+        }
+    }
+
+    fn read_gem_clipboard(&mut self) {
+        match arboard::Clipboard::new().and_then(|mut clipboard| clipboard.get_text()) {
+            Ok(text) => {
+                self.gem_input = text;
+                self.capture_gem();
+            }
+            Err(error) => self.gem_status = format!("Could not read clipboard: {error}"),
+        }
+    }
+
     fn inspect_passives(&mut self) {
         match inspect_passive_tree_url(&self.offline_character.passive_tree_url) {
             Ok(info) => {
                 self.passive_status = format!(
-                    "Tree v{} · class {} · ascendancy {} · {} nodes · {} cluster nodes · {} masteries{}",
+                    "Tree v{} · class {} · ascendancy {} · {} nodes · {} cluster nodes · {} masteries{} · node IDs {}",
                     info.version,
                     info.class_id,
                     info.ascendancy_id,
@@ -534,7 +707,8 @@ impl CompanionApp {
                         String::new()
                     } else {
                         format!(" · bloodline {}", info.bloodline_id)
-                    }
+                    },
+                    info.allocated_node_ids.iter().take(12).map(u16::to_string).collect::<Vec<_>>().join(", ")
                 );
             }
             Err(error) => self.passive_status = error.to_string(),
@@ -559,9 +733,10 @@ impl CompanionApp {
             return;
         }
         self.ocr_status = format!("Reading {} locally…", path.display());
+        let region = self.capture_region;
         let (sender, receiver) = mpsc::channel();
         std::thread::spawn(move || {
-            let result = run_tesseract(&path);
+            let result = run_tesseract(&path, region);
             let _ = sender.send(result);
         });
         self.ocr_receiver = Some(receiver);
@@ -581,14 +756,26 @@ impl CompanionApp {
             "exile-companion-character-{capture_id}-{}.png",
             std::process::id()
         ));
+        let region = self.capture_region;
         let (sender, receiver) = mpsc::channel();
         std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_millis(650));
-            let result = capture_current_screen(&path).and_then(|()| run_tesseract(&path));
+            let result = capture_current_screen(&path).and_then(|()| run_tesseract(&path, region));
             let _ = std::fs::remove_file(&path);
             let _ = sender.send(result);
         });
         self.ocr_receiver = Some(receiver);
+    }
+
+    fn capture_character_screen(&mut self, ctx: &egui::Context) {
+        self.ocr_for_map_mods = false;
+        self.capture_screen_and_ocr(ctx);
+    }
+
+    fn capture_map_mod_screen(&mut self, ctx: &egui::Context) {
+        self.ocr_for_map_mods = true;
+        self.capture_region = CaptureRegion::TopCenter;
+        self.capture_screen_and_ocr(ctx);
     }
 
     fn choose_screenshot_watch_folder(&mut self) {
@@ -797,7 +984,16 @@ impl CompanionApp {
                 Ok(result) => {
                     self.ocr_text = result.text;
                     self.ocr_confidence = result.confidence;
-                    self.apply_ocr_text(false)
+                    if self.ocr_for_map_mods {
+                        self.map_mod_input = self.ocr_text.clone();
+                        self.analyze_map_mods();
+                        self.ocr_status =
+                            format!("Map modifier OCR complete · {}", self.map_mod_status);
+                        self.ocr_for_map_mods = false;
+                        true
+                    } else {
+                        self.apply_ocr_text(false)
+                    }
                 }
                 Err(error) => {
                     self.ocr_status = error.clone();
@@ -1535,7 +1731,7 @@ impl CompanionApp {
                         )
                         .clicked()
                     {
-                        self.capture_screen_and_ocr(ui.ctx());
+                        self.capture_character_screen(ui.ctx());
                     }
                     if ui
                         .add_enabled(
@@ -1641,6 +1837,41 @@ impl CompanionApp {
                         ui.end_row();
                     });
                 if identity_changed {
+                    self.persist_current_character();
+                }
+            });
+        ui.add_space(14.0);
+
+        egui::Frame::new()
+            .fill(PANEL)
+            .stroke(Stroke::new(1.0, Color32::from_rgb(48, 45, 41)))
+            .corner_radius(5.0)
+            .inner_margin(18.0)
+            .show(ui, |ui| {
+                ui.label(RichText::new("SKILL GEMS AND LINKS").size(11.0).color(GOLD).strong());
+                ui.label(RichText::new("Copy each skill/support gem and assign the same group name to gems that are linked together.").color(TEXT_MUTED));
+                ui.horizontal(|ui| {
+                    ui.label("Link group");
+                    ui.text_edit_singleline(&mut self.gem_group);
+                    if ui.button("Read copied gem").clicked() {
+                        self.read_gem_clipboard();
+                    }
+                    if ui.add_enabled(!self.gem_input.trim().is_empty(), egui::Button::new("Capture pasted gem")).clicked() {
+                        self.capture_gem();
+                    }
+                });
+                ui.add(egui::TextEdit::multiline(&mut self.gem_input).hint_text("Paste copied gem text…").desired_rows(3).desired_width(f32::INFINITY));
+                ui.label(RichText::new(&self.gem_status).color(TEXT_MUTED));
+                let mut remove = None;
+                for (index, gem) in self.offline_character.gems.iter().enumerate() {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(&gem.group).color(GOLD));
+                        ui.label(format!("{} · level {} · quality {:+}%", gem.name, gem.level, gem.quality));
+                        if ui.small_button("Remove").clicked() { remove = Some(index); }
+                    });
+                }
+                if let Some(index) = remove {
+                    self.offline_character.gems.remove(index);
                     self.persist_current_character();
                 }
             });
@@ -1773,6 +2004,17 @@ impl CompanionApp {
                         .color(TEXT_MUTED),
                 );
                 ui.horizontal(|ui| {
+                    ui.label("OCR region");
+                    egui::ComboBox::from_id_salt("ocr_capture_region")
+                        .selected_text(self.capture_region.label())
+                        .show_ui(ui, |ui| {
+                            for region in [CaptureRegion::FullScreen, CaptureRegion::CenterPanel, CaptureRegion::TopCenter] {
+                                ui.selectable_value(&mut self.capture_region, region, region.label());
+                            }
+                        });
+                    ui.label(RichText::new("Cropping improves accuracy and never changes the original screenshot.").size(11.0).color(TEXT_MUTED));
+                });
+                ui.horizontal(|ui| {
                     if ui
                         .add_enabled(
                             self.ocr_receiver.is_none(),
@@ -1780,7 +2022,7 @@ impl CompanionApp {
                         )
                         .clicked()
                     {
-                        self.capture_screen_and_ocr(ui.ctx());
+                        self.capture_character_screen(ui.ctx());
                     }
                     if ui
                         .add_enabled(
@@ -2492,7 +2734,7 @@ impl CompanionApp {
                 )
                 .clicked()
             {
-                self.capture_screen_and_ocr(ctx);
+                self.capture_character_screen(ctx);
             }
             if ui
                 .add_enabled(
@@ -2549,6 +2791,26 @@ impl CompanionApp {
         );
         let defense_summary = captured_defense_summary(&self.offline_character);
         ui.label(RichText::new(defense_summary).size(11.0));
+        let assessment = assess_character(&self.offline_character);
+        ui.label(
+            RichText::new(format!(
+                "Local assessment · raw Life+ES {} · {} gems in {} groups",
+                assessment
+                    .raw_life_es_pool
+                    .map_or_else(|| "unknown".into(), |value| value.to_string()),
+                self.offline_character.gems.len(),
+                assessment.gem_groups
+            ))
+            .size(10.0)
+            .color(TEXT_MUTED),
+        );
+        if let Some(warning) = assessment
+            .resistance_gaps
+            .first()
+            .or_else(|| assessment.warnings.first())
+        {
+            ui.colored_label(GOLD, warning);
+        }
         if !self.item_comparison.is_empty() {
             ui.label(
                 RichText::new(format!("LAST ITEM · {}", self.item_comparison))
@@ -2598,6 +2860,16 @@ impl CompanionApp {
             .size(10.0)
             .color(TEXT_MUTED),
         );
+        ui.horizontal(|ui| {
+            if let Some(started) = self.active_map_started {
+                ui.label(format!("RUN {}", format_duration(started.elapsed())));
+                if ui.small_button("Finish run").clicked() {
+                    self.finish_map_run();
+                }
+            } else if ui.small_button("Start map run").clicked() {
+                self.start_map_run();
+            }
+        });
         ui.separator();
         egui::ScrollArea::vertical()
             .max_height(if self.hud_extra_compact { 170.0 } else { 245.0 })
@@ -2674,40 +2946,169 @@ impl CompanionApp {
         }
     }
 
-    fn tools(&self, ui: &mut egui::Ui) {
+    fn tools(&mut self, ui: &mut egui::Ui) {
         section_intro(
             ui,
-            "Tools",
-            "Local calculators and user-driven helpers belong here as the project grows.",
+            "Local competitive toolkit",
+            "Planning and analysis stay on this machine. Inputs are captured or entered by you, and estimates are labelled.",
         );
         ui.columns(2, |columns| {
-            tool_card(
-                &mut columns[0],
-                "Price checker",
-                "Official API-backed item pricing",
-                "PLANNED",
-            );
-            tool_card(
-                &mut columns[1],
-                "Craft calculator",
-                "Costs and probability estimates",
-                "PLANNED",
-            );
+            planner_frame(&mut columns[0], "MAP MOD RISK CHECK", |ui| {
+                ui.label("One risk phrase per line");
+                ui.add(
+                    egui::TextEdit::multiline(&mut self.map_risk_rules)
+                        .desired_rows(4)
+                        .desired_width(f32::INFINITY),
+                );
+                ui.label("Paste map modifiers");
+                ui.add(
+                    egui::TextEdit::multiline(&mut self.map_mod_input)
+                        .desired_rows(5)
+                        .desired_width(f32::INFINITY),
+                );
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_enabled(
+                            self.ocr_receiver.is_none(),
+                            egui::Button::new("Capture map mods"),
+                        )
+                        .clicked()
+                    {
+                        self.capture_map_mod_screen(ui.ctx());
+                    }
+                    if ui.button("Check risks").clicked() {
+                        self.analyze_map_mods();
+                    }
+                    if ui.button("Save rules").clicked() {
+                        let value = self.map_risk_rules.clone();
+                        self.save_planner_text("planner.map_risks", &value);
+                    }
+                });
+                ui.label(RichText::new(&self.map_mod_status).color(
+                    if self.map_mod_status.starts_with("DANGER") {
+                        DANGER
+                    } else {
+                        TEXT_MUTED
+                    },
+                ));
+            });
+            planner_frame(&mut columns[1], "CRAFTING PLANNER", |ui| {
+                ui.label("Paste copied item text for a transparent local summary.");
+                ui.add(
+                    egui::TextEdit::multiline(&mut self.crafting_input)
+                        .desired_rows(6)
+                        .desired_width(f32::INFINITY),
+                );
+                ui.horizontal(|ui| {
+                    if ui.button("Read clipboard").clicked() {
+                        if let Ok(text) =
+                            arboard::Clipboard::new().and_then(|mut clipboard| clipboard.get_text())
+                        {
+                            self.crafting_input = text;
+                        }
+                    }
+                    if ui.button("Analyze item").clicked() {
+                        self.analyze_crafting_item();
+                    }
+                });
+                ui.add(
+                    egui::TextEdit::multiline(&mut self.crafting_plan)
+                        .hint_text("Your local craft plan and notes…")
+                        .desired_rows(6)
+                        .desired_width(f32::INFINITY),
+                );
+                if ui.button("Save plan").clicked() {
+                    let value = self.crafting_plan.clone();
+                    self.save_planner_text("planner.crafting", &value);
+                }
+            });
         });
-        ui.add_space(10.0);
+        ui.add_space(14.0);
         ui.columns(2, |columns| {
-            tool_card(
-                &mut columns[0],
-                "Map planner",
-                "Atlas strategy and session planning",
-                "PLANNED",
+            planner_frame(&mut columns[0], "MAP RUN JOURNAL", |ui| {
+                ui.label(format!(
+                    "Current area: {}",
+                    if self.current_area.is_empty() {
+                        "unknown"
+                    } else {
+                        &self.current_area
+                    }
+                ));
+                ui.horizontal(|ui| {
+                    if let Some(started) = self.active_map_started {
+                        ui.label(format!("Running {}", format_duration(started.elapsed())));
+                        if ui.button("Finish and save").clicked() {
+                            self.finish_map_run();
+                        }
+                    } else if ui.button("Start run").clicked() {
+                        self.start_map_run();
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Investment");
+                    ui.text_edit_singleline(&mut self.map_investment);
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Loot/value");
+                    ui.text_edit_singleline(&mut self.map_loot);
+                });
+                ui.separator();
+                for run in self.map_runs.iter().take(6) {
+                    ui.label(format!(
+                        "{} · {} · {} deaths · in {} · out {}",
+                        run.area,
+                        format_duration(std::time::Duration::from_secs(run.duration_seconds)),
+                        run.deaths,
+                        run.investment,
+                        run.loot
+                    ));
+                }
+            });
+            planner_frame(&mut columns[1], "PROGRESSION CHECKLIST", |ui| {
+                for (complete, label) in progression_checklist(&self.offline_character) {
+                    ui.colored_label(
+                        if complete { SUCCESS } else { GOLD },
+                        format!("{} {label}", if complete { "DONE" } else { "TODO" }),
+                    );
+                }
+                ui.separator();
+                let assessment = assess_character(&self.offline_character);
+                for warning in assessment
+                    .resistance_gaps
+                    .iter()
+                    .chain(assessment.warnings.iter())
+                {
+                    ui.label(RichText::new(warning).size(11.0).color(TEXT_MUTED));
+                }
+            });
+        });
+        ui.add_space(14.0);
+        planner_frame(ui, "LOCAL LOOT FILTER EDITOR", |ui| {
+            ui.add(
+                egui::TextEdit::multiline(&mut self.loot_filter_text)
+                    .font(egui::TextStyle::Monospace)
+                    .desired_rows(12)
+                    .desired_width(f32::INFINITY),
             );
-            tool_card(
-                &mut columns[1],
-                "Loot filters",
-                "Create and manage item filters",
-                "PLANNED",
-            );
+            ui.horizontal(|ui| {
+                if ui.button("Validate locally").clicked() {
+                    self.validate_loot_filter();
+                }
+                if ui.button("Export .filter…").clicked() {
+                    if let Some(path) = rfd::FileDialog::new()
+                        .add_filter("Path of Exile filter", &["filter"])
+                        .set_file_name("ExileCompanion.filter")
+                        .save_file()
+                    {
+                        self.loot_filter_status =
+                            match std::fs::write(&path, &self.loot_filter_text) {
+                                Ok(()) => format!("Exported {}", path.display()),
+                                Err(error) => format!("Export failed: {error}"),
+                            };
+                    }
+                }
+            });
+            ui.label(RichText::new(&self.loot_filter_status).color(TEXT_MUTED));
         });
     }
 
@@ -2903,9 +3304,18 @@ impl eframe::App for CompanionApp {
     }
 }
 
-fn run_tesseract(path: &std::path::Path) -> Result<OcrResult, String> {
-    std::process::Command::new("tesseract")
-        .arg(path)
+fn run_tesseract(path: &std::path::Path, region: CaptureRegion) -> Result<OcrResult, String> {
+    let cropped_path = (region != CaptureRegion::FullScreen).then(|| {
+        std::env::temp_dir().join(format!("exile-companion-ocr-crop-{}.png", new_profile_id()))
+    });
+    let target = if let Some(cropped) = &cropped_path {
+        crop_ocr_region(path, cropped, region)?;
+        cropped.as_path()
+    } else {
+        path
+    };
+    let result = std::process::Command::new("tesseract")
+        .arg(target)
         .arg("stdout")
         .args(["--psm", "6", "tsv"])
         .output()
@@ -2925,7 +3335,31 @@ fn run_tesseract(path: &std::path::Path) -> Result<OcrResult, String> {
                     String::from_utf8_lossy(&output.stderr).trim()
                 ))
             }
-        })
+        });
+    if let Some(cropped) = cropped_path {
+        let _ = std::fs::remove_file(cropped);
+    }
+    result
+}
+
+fn crop_ocr_region(
+    source: &std::path::Path,
+    target: &std::path::Path,
+    region: CaptureRegion,
+) -> Result<(), String> {
+    use image::GenericImageView;
+    let image =
+        image::open(source).map_err(|error| format!("Could not open screenshot: {error}"))?;
+    let (width, height) = image.dimensions();
+    let (x, y, crop_width, crop_height) = match region {
+        CaptureRegion::FullScreen => (0, 0, width, height),
+        CaptureRegion::CenterPanel => (width / 5, height / 10, width * 3 / 5, height * 4 / 5),
+        CaptureRegion::TopCenter => (width / 6, 0, width * 2 / 3, height / 2),
+    };
+    image
+        .crop_imm(x, y, crop_width.max(1), crop_height.max(1))
+        .save(target)
+        .map_err(|error| format!("Could not prepare OCR region: {error}"))
 }
 
 fn parse_tesseract_tsv(tsv: &str) -> Result<OcrResult, String> {
@@ -3196,6 +3630,104 @@ fn stored_f32(store: &Option<EventStore>, key: &str) -> Option<f32> {
         .as_ref()
         .and_then(|store| store.preference(key).ok().flatten())
         .and_then(|value| value.parse().ok())
+}
+
+fn stored_text(store: &Option<EventStore>, key: &str, fallback: &str) -> String {
+    store
+        .as_ref()
+        .and_then(|store| store.preference(key).ok().flatten())
+        .unwrap_or_else(|| fallback.to_string())
+}
+
+fn find_map_risks(mods: &str, rules: &str) -> Vec<String> {
+    let haystack = mods.to_ascii_lowercase();
+    rules
+        .lines()
+        .map(str::trim)
+        .filter(|rule| !rule.is_empty() && haystack.contains(&rule.to_ascii_lowercase()))
+        .map(str::to_string)
+        .collect()
+}
+
+fn crafting_summary(input: &str) -> String {
+    match parse_item_text("Craft target", input) {
+        Ok(item) => {
+            let recognized = [
+                ("life", item.bonuses.life),
+                ("ES", item.bonuses.energy_shield),
+                ("fire res", item.bonuses.fire_resistance),
+                ("cold res", item.bonuses.cold_resistance),
+                ("lightning res", item.bonuses.lightning_resistance),
+                ("chaos res", item.bonuses.chaos_resistance),
+            ]
+            .into_iter()
+            .filter(|(_, value)| *value != 0)
+            .map(|(name, value)| format!("{name} {value:+}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+            format!(
+                "Target: {} ({})\nRecognized values: {}\n\nPlan:\n1. Define the required final affixes.\n2. Confirm item level and influence in the copied text.\n3. Record each user-performed craft and its cost here.\n\nPrefix/suffix identity and crafting weights are not inferred from plain clipboard text.",
+                item.name,
+                item.base_type,
+                if recognized.is_empty() { "none" } else { &recognized }
+            )
+        }
+        Err(error) => format!("Could not parse craft target: {error}"),
+    }
+}
+
+fn validate_loot_filter(filter: &str) -> String {
+    let mut blocks = 0_u32;
+    let mut outside = Vec::new();
+    let mut in_block = false;
+    for (index, line) in filter.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if matches!(line, "Show" | "Hide" | "Minimal") {
+            blocks += 1;
+            in_block = true;
+        } else if !in_block {
+            outside.push(index + 1);
+        }
+    }
+    if blocks == 0 {
+        "Invalid: add at least one Show or Hide block".into()
+    } else if !outside.is_empty() {
+        format!("Review lines outside a block: {:?}", outside)
+    } else if !filter.matches('"').count().is_multiple_of(2) {
+        "Invalid: an item-filter quote is not closed".into()
+    } else {
+        format!("Local structure check passed · {blocks} blocks. Validate in PoE after export.")
+    }
+}
+
+fn progression_checklist(character: &OfflineCharacter) -> Vec<(bool, &'static str)> {
+    vec![
+        (!character.name.is_empty(), "Character identity captured"),
+        (character.items.len() >= 8, "Core equipment slots captured"),
+        (
+            !character.gems.is_empty(),
+            "Skill gems and link groups captured",
+        ),
+        (
+            !character.sheet_stats.is_empty(),
+            "Character sheet captured",
+        ),
+        (
+            !character.passive_tree_url.is_empty(),
+            "Passive tree URL captured",
+        ),
+        (
+            character.sheet_stats.contains_key("Fire Resistance"),
+            "Elemental resistances reviewed",
+        ),
+        (
+            character.sheet_stats.contains_key("Chaos Resistance"),
+            "Chaos resistance reviewed",
+        ),
+    ]
 }
 
 fn edit_distance(left: &str, right: &str) -> usize {
@@ -3581,20 +4113,16 @@ fn empty_state(ui: &mut egui::Ui, title: &str, description: &str) {
         });
 }
 
-fn tool_card(ui: &mut egui::Ui, title: &str, description: &str, badge: &str) {
+fn planner_frame(ui: &mut egui::Ui, title: &str, content: impl FnOnce(&mut egui::Ui)) {
     egui::Frame::new()
         .fill(PANEL)
         .stroke(Stroke::new(1.0_f32, Color32::from_rgb(48, 45, 41)))
         .corner_radius(5.0)
         .inner_margin(18.0)
         .show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.heading(title);
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label(RichText::new(badge).size(10.0).color(GOLD_DIM).strong());
-                });
-            });
-            ui.label(RichText::new(description).color(TEXT_MUTED));
+            ui.label(RichText::new(title).size(11.0).color(GOLD).strong());
+            ui.separator();
+            content(ui);
         });
 }
 
@@ -3614,5 +4142,29 @@ mod tests {
     fn identifies_close_ocr_names() {
         assert_eq!(edit_distance("MapRunner", "MapRuner"), 1);
         assert!(edit_distance("MapRunner", "OtherBuild") > 2);
+    }
+
+    #[test]
+    fn matches_only_configured_map_risks() {
+        let mods = "Players cannot Regenerate Life, Mana or Energy Shield\nMonsters reflect 18% of Elemental Damage";
+        let risks = find_map_risks(mods, "cannot regenerate\nreflect\nreduced aura effect");
+        assert_eq!(risks, vec!["cannot regenerate", "reflect"]);
+    }
+
+    #[test]
+    fn validates_basic_loot_filter_structure() {
+        assert!(validate_loot_filter("Show\n  Class \"Currency\"")
+            .starts_with("Local structure check passed"));
+        assert!(validate_loot_filter("Class \"Currency\"").contains("Invalid"));
+        assert!(validate_loot_filter("Show\n  BaseType \"Chaos Orb").contains("quote"));
+    }
+
+    #[test]
+    fn crafting_summary_uses_copied_item_values() {
+        let item = "Item Class: Rings\nRarity: Rare\nDoom Circle\nAmethyst Ring\n--------\n+70 to maximum Life\n+31% to Fire Resistance";
+        let summary = crafting_summary(item);
+        assert!(summary.contains("Doom Circle"));
+        assert!(summary.contains("life +70"));
+        assert!(summary.contains("fire res +31"));
     }
 }

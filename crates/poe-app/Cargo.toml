@@ -8,6 +8,7 @@ license.workspace = true
 anyhow.workspace = true
 arboard.workspace = true
 eframe.workspace = true
+image.workspace = true
 poe-ai = { path = "../poe-ai" }
 poe-character = { path = "../poe-character" }
 poe-core = { path = "../poe-core" }
