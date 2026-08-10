@@ -9,7 +9,7 @@ use poe_core::{parse_trade_request, EventKind, GameEvent, SessionStats, TradeReq
 use poe_logs::{spawn_tail, LogUpdate};
 use poe_platform::{discover_client_log, is_poe_running};
 use poe_pob::PobBuild;
-use poe_storage::{CharacterSnapshotRecord, EventStore, MapRunRecord};
+use poe_storage::{CharacterSnapshotRecord, EventStore, MapRunRecord, TradeHistoryRecord};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, HashSet, VecDeque},
@@ -218,6 +218,14 @@ struct BackupBundle {
     loot_filter_text: String,
     screenshot_watch_folder: String,
     custom_crop: OcrCrop,
+    #[serde(default)]
+    trade_history: Vec<TradeHistoryRecord>,
+    #[serde(default)]
+    ocr_preprocess: OcrPreprocess,
+    #[serde(default)]
+    ocr_presets: BTreeMap<String, OcrCalibrationPreset>,
+    #[serde(default)]
+    local_data_pack_path: String,
 }
 
 #[derive(Debug, Clone)]
@@ -231,6 +239,64 @@ struct DiagnosticResult {
 struct OcrResult {
     text: String,
     confidence: Option<f32>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+struct OcrPreprocess {
+    grayscale: bool,
+    contrast: f32,
+    scale: u32,
+}
+
+impl Default for OcrPreprocess {
+    fn default() -> Self {
+        Self {
+            grayscale: true,
+            contrast: 24.0,
+            scale: 2,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+struct OcrCalibrationPreset {
+    crop: OcrCrop,
+    preprocess: OcrPreprocess,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+struct LocalDataPack {
+    format_version: u32,
+    poe_version: String,
+    label: String,
+    modifier_rules: Vec<ModifierRule>,
+    gem_tags: BTreeMap<String, Vec<String>>,
+    passive_nodes: BTreeMap<String, String>,
+    maps: Vec<String>,
+    bosses: Vec<String>,
+    pantheons: Vec<String>,
+    crafting_notes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+struct ModifierRule {
+    label: String,
+    pattern: String,
+    desirable_minimum: Option<i32>,
+}
+
+#[derive(Debug, Clone)]
+struct ReleaseInfo {
+    tag: String,
+    url: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TradeOutcome {
+    Completed,
+    Dismissed,
 }
 
 #[derive(Debug, Clone)]
@@ -268,6 +334,9 @@ struct CompanionApp {
     last_character_capture: Option<std::time::Instant>,
     capture_region: CaptureRegion,
     custom_ocr_crop: OcrCrop,
+    ocr_preprocess: OcrPreprocess,
+    ocr_presets: BTreeMap<String, OcrCalibrationPreset>,
+    ocr_preset_key: String,
     ocr_preview: Option<egui::TextureHandle>,
     ocr_preview_source: Option<PathBuf>,
     ocr_for_map_mods: bool,
@@ -298,6 +367,8 @@ struct CompanionApp {
     hud_alerts: VecDeque<HudAlert>,
     dismissed_trades: HashSet<String>,
     live_trades: VecDeque<TradeRequest>,
+    trade_history: Vec<TradeHistoryRecord>,
+    trade_notifications: bool,
     current_area: String,
     area_entered_at: Option<std::time::Instant>,
     session_started_at: std::time::Instant,
@@ -325,7 +396,13 @@ struct CompanionApp {
     passive_node_names: BTreeMap<u16, String>,
     passive_data_path: String,
     passive_data_status: String,
+    local_data_pack: Option<LocalDataPack>,
+    local_data_pack_path: String,
+    local_data_pack_status: String,
     diagnostics: Vec<DiagnosticResult>,
+    setup_complete: bool,
+    update_status: String,
+    update_receiver: Option<Receiver<Result<ReleaseInfo, String>>>,
     backup_status: String,
     crash_log: String,
     crash_log_path: PathBuf,
@@ -377,11 +454,16 @@ impl CompanionApp {
         let hud_position = stored_f32(&store, "hud.x")
             .zip(stored_f32(&store, "hud.y"))
             .map(|(x, y)| egui::pos2(x, y));
-        let map_risk_rules = stored_text(
+        let default_map_risk_rules = stored_text(
             &store,
             "planner.map_risks",
             "reflect\ncannot regenerate\nreduced recovery\nmaximum resistances",
         );
+        let map_risk_rules = if offline_character.map_risk_rules.trim().is_empty() {
+            default_map_risk_rules
+        } else {
+            offline_character.map_risk_rules.clone()
+        };
         let crafting_plan = stored_text(&store, "planner.crafting", "");
         let loot_filter_text = stored_text(
             &store,
@@ -392,6 +474,10 @@ impl CompanionApp {
             .as_ref()
             .and_then(|store| store.map_runs(10_000).ok())
             .unwrap_or_default();
+        let trade_history = store
+            .as_ref()
+            .and_then(|store| store.trade_history(250).ok())
+            .unwrap_or_default();
         let custom_ocr_crop = OcrCrop {
             left: stored_f32(&store, "ocr.crop.left").unwrap_or(0.2),
             top: stored_f32(&store, "ocr.crop.top").unwrap_or(0.1),
@@ -399,6 +485,16 @@ impl CompanionApp {
             height: stored_f32(&store, "ocr.crop.height").unwrap_or(0.8),
         }
         .normalized();
+        let ocr_preprocess = OcrPreprocess {
+            grayscale: stored_bool(&store, "ocr.preprocess.grayscale", true),
+            contrast: stored_f32(&store, "ocr.preprocess.contrast").unwrap_or(24.0),
+            scale: stored_text(&store, "ocr.preprocess.scale", "2")
+                .parse()
+                .unwrap_or(2)
+                .clamp(1, 4),
+        };
+        let ocr_presets =
+            serde_json::from_str(&stored_text(&store, "ocr.presets", "{}")).unwrap_or_default();
         let diagnostics = initial_diagnostics(
             &guessed,
             store.is_some(),
@@ -418,6 +514,14 @@ impl CompanionApp {
                 passive_node_names.len()
             )
         };
+        let local_data_pack_path = stored_text(&store, "data_pack.path", "");
+        let local_data_pack = load_local_data_pack_path(&local_data_pack_path).ok();
+        let local_data_pack_status = local_data_pack.as_ref().map_or_else(
+            || "No versioned local data pack loaded".into(),
+            |pack| format!("{} · PoE {}", pack.label, pack.poe_version),
+        );
+        let trade_notifications = stored_bool(&store, "trade.notifications", true);
+        let setup_complete = stored_bool(&store, "setup.complete", false);
         Self {
             page: Page::Dashboard,
             filter: EventFilter::All,
@@ -447,6 +551,9 @@ impl CompanionApp {
             last_character_capture: None,
             capture_region: CaptureRegion::CenterPanel,
             custom_ocr_crop,
+            ocr_preprocess,
+            ocr_presets,
+            ocr_preset_key: String::new(),
             ocr_preview: None,
             ocr_preview_source: None,
             ocr_for_map_mods: false,
@@ -479,6 +586,8 @@ impl CompanionApp {
             hud_alerts: VecDeque::new(),
             dismissed_trades: HashSet::new(),
             live_trades: VecDeque::new(),
+            trade_history,
+            trade_notifications,
             current_area: String::new(),
             area_entered_at: None,
             session_started_at: std::time::Instant::now(),
@@ -506,7 +615,13 @@ impl CompanionApp {
             passive_node_names,
             passive_data_path,
             passive_data_status,
+            local_data_pack,
+            local_data_pack_path,
+            local_data_pack_status,
             diagnostics,
+            setup_complete,
+            update_status: "Update checks are manual and use the public GitHub release page".into(),
+            update_receiver: None,
             backup_status:
                 "Backups include characters, map runs, planner data, and capture settings".into(),
             crash_log: std::fs::read_to_string(&crash_log_path).unwrap_or_default(),
@@ -564,7 +679,7 @@ impl CompanionApp {
     }
 
     fn analyze_crafting_item(&mut self) {
-        self.crafting_plan = crafting_summary(&self.crafting_input);
+        self.crafting_plan = crafting_summary(&self.crafting_input, self.local_data_pack.as_ref());
         let value = self.crafting_plan.clone();
         self.save_planner_text("planner.crafting", &value);
     }
@@ -573,6 +688,70 @@ impl CompanionApp {
         self.loot_filter_status = validate_loot_filter(&self.loot_filter_text);
         let value = self.loot_filter_text.clone();
         self.save_planner_text("planner.loot_filter", &value);
+    }
+
+    fn choose_local_data_pack(&mut self) {
+        let Some(path) = rfd::FileDialog::new()
+            .set_title("Load a versioned Exile Companion data pack")
+            .add_filter("Exile Companion data pack", &["json"])
+            .pick_file()
+        else {
+            return;
+        };
+        match load_local_data_pack_path(&path.display().to_string()) {
+            Ok(pack) => {
+                for (id, name) in &pack.passive_nodes {
+                    if let Ok(id) = id.parse::<u16>() {
+                        self.passive_node_names.insert(id, name.clone());
+                    }
+                }
+                self.local_data_pack_path = path.display().to_string();
+                self.local_data_pack_status = format!(
+                    "Loaded {} · PoE {} · {} modifier rules · {} maps",
+                    pack.label,
+                    pack.poe_version,
+                    pack.modifier_rules.len(),
+                    pack.maps.len()
+                );
+                self.local_data_pack = Some(pack);
+                if let Some(store) = &self.store {
+                    let _ = store.set_preference("data_pack.path", &self.local_data_pack_path);
+                }
+            }
+            Err(error) => self.local_data_pack_status = error,
+        }
+    }
+
+    fn export_local_data_pack_template(&mut self) {
+        let Some(path) = rfd::FileDialog::new()
+            .set_title("Export local data-pack template")
+            .add_filter("JSON", &["json"])
+            .set_file_name("exile-companion-data-pack.json")
+            .save_file()
+        else {
+            return;
+        };
+        let pack = LocalDataPack {
+            format_version: 1,
+            poe_version: "replace-with-current-poe-version".into(),
+            label: "My local PoE data pack".into(),
+            modifier_rules: vec![ModifierRule {
+                label: "Maximum life".into(),
+                pattern: "maximum life".into(),
+                desirable_minimum: Some(70),
+            }],
+            crafting_notes: vec![
+                "Keep this file local and update its version label each league.".into(),
+            ],
+            ..Default::default()
+        };
+        self.local_data_pack_status = match serde_json::to_string_pretty(&pack)
+            .map_err(|error| error.to_string())
+            .and_then(|data| std::fs::write(&path, data).map_err(|error| error.to_string()))
+        {
+            Ok(()) => format!("Exported starter data pack to {}", path.display()),
+            Err(error) => format!("Could not export data pack: {error}"),
+        };
     }
 
     fn start_map_run(&mut self) {
@@ -682,6 +861,10 @@ impl CompanionApp {
             loot_filter_text: self.loot_filter_text.clone(),
             screenshot_watch_folder: self.screenshot_watch_folder.clone(),
             custom_crop: self.custom_ocr_crop,
+            trade_history: self.trade_history.clone(),
+            ocr_preprocess: self.ocr_preprocess,
+            ocr_presets: self.ocr_presets.clone(),
+            local_data_pack_path: self.local_data_pack_path.clone(),
         };
         self.backup_status = match serde_json::to_string_pretty(&bundle)
             .map_err(|error| error.to_string())
@@ -740,6 +923,10 @@ impl CompanionApp {
         self.loot_filter_text = bundle.loot_filter_text;
         self.screenshot_watch_folder = bundle.screenshot_watch_folder;
         self.custom_ocr_crop = bundle.custom_crop.normalized();
+        self.ocr_preprocess = bundle.ocr_preprocess;
+        self.ocr_presets = bundle.ocr_presets;
+        self.local_data_pack_path = bundle.local_data_pack_path;
+        self.local_data_pack = load_local_data_pack_path(&self.local_data_pack_path).ok();
 
         if let Some(store) = &self.store {
             for character in &self.characters {
@@ -761,11 +948,18 @@ impl CompanionApp {
                     let _ = store.record_map_run(&run);
                 }
             }
+            for trade in bundle.trade_history {
+                if !self.trade_history.contains(&trade) {
+                    let _ = store.record_trade(&trade);
+                }
+            }
             let _ = store.set_preference("planner.map_risks", &self.map_risk_rules);
             let _ = store.set_preference("planner.crafting", &self.crafting_plan);
             let _ = store.set_preference("planner.loot_filter", &self.loot_filter_text);
             self.snapshots = store.character_snapshots(20).unwrap_or_default();
             self.map_runs = store.map_runs(10_000).unwrap_or_default();
+            self.trade_history = store.trade_history(250).unwrap_or_default();
+            let _ = store.set_preference("data_pack.path", &self.local_data_pack_path);
         }
         self.save_custom_crop();
         self.backup_status = format!("Restored and merged backup from {}", path.display());
@@ -798,10 +992,57 @@ impl CompanionApp {
         self.diagnostics.push(ollama);
     }
 
+    fn check_for_updates(&mut self) {
+        if self.update_receiver.is_some() {
+            return;
+        }
+        self.update_status = "Checking the public GitHub release feed…".into();
+        let (sender, receiver) = mpsc::channel();
+        std::thread::spawn(move || {
+            let result = reqwest::blocking::Client::builder()
+                .timeout(std::time::Duration::from_secs(10))
+                .build()
+                .map_err(|error| error.to_string())
+                .and_then(|client| {
+                    client
+                        .get("https://api.github.com/repos/kennethyork/ExileCompanion/releases/latest")
+                        .header(reqwest::header::USER_AGENT, "ExileCompanion update check")
+                        .send()
+                        .and_then(reqwest::blocking::Response::error_for_status)
+                        .map_err(|error| error.to_string())
+                })
+                .and_then(|response| response.json::<serde_json::Value>().map_err(|error| error.to_string()))
+                .and_then(|value| {
+                    let tag = value.get("tag_name").and_then(serde_json::Value::as_str).ok_or_else(|| "Release response did not contain a tag".to_string())?;
+                    let url = value.get("html_url").and_then(serde_json::Value::as_str).ok_or_else(|| "Release response did not contain a URL".to_string())?;
+                    Ok(ReleaseInfo { tag: tag.into(), url: url.into() })
+                });
+            let _ = sender.send(result);
+        });
+        self.update_receiver = Some(receiver);
+    }
+
+    fn collect_update_check(&mut self) {
+        let Some(receiver) = &self.update_receiver else {
+            return;
+        };
+        if let Ok(result) = receiver.try_recv() {
+            self.update_status = match result {
+                Ok(info) if info.tag.trim_start_matches('v') == env!("CARGO_PKG_VERSION") => {
+                    format!("You are up to date ({}) · {}", info.tag, info.url)
+                }
+                Ok(info) => format!("{} is available · {}", info.tag, info.url),
+                Err(error) => format!("Update check failed: {error}"),
+            };
+            self.update_receiver = None;
+        }
+    }
+
     fn persist_current_character(&mut self) {
         if self.offline_character.profile_id.is_empty() {
             self.offline_character.profile_id = new_profile_id();
         }
+        self.offline_character.map_risk_rules = self.map_risk_rules.clone();
         if let Some(slot) = self.characters.get_mut(self.active_character_index) {
             *slot = self.offline_character.clone();
         } else {
@@ -822,6 +1063,15 @@ impl CompanionApp {
         self.persist_current_character();
         self.active_character_index = index;
         self.offline_character = self.characters[index].clone();
+        self.map_risk_rules = if self.offline_character.map_risk_rules.trim().is_empty() {
+            stored_text(
+                &self.store,
+                "planner.map_risks",
+                "reflect\ncannot regenerate\nreduced recovery\nmaximum resistances",
+            )
+        } else {
+            self.offline_character.map_risk_rules.clone()
+        };
         self.character_analysis = self.offline_character.ollama_review.clone();
         self.snapshot_status = format!(
             "Switched to {}",
@@ -836,6 +1086,11 @@ impl CompanionApp {
         self.characters.push(character.clone());
         self.active_character_index = self.characters.len() - 1;
         self.offline_character = character;
+        self.map_risk_rules = stored_text(
+            &self.store,
+            "planner.map_risks",
+            "reflect\ncannot regenerate\nreduced recovery\nmaximum resistances",
+        );
         self.character_analysis.clear();
         self.snapshot_status = "Created a new local character profile".into();
         self.push_hud_alert(self.snapshot_status.clone(), false);
@@ -1090,6 +1345,13 @@ impl CompanionApp {
         let Some(path) = self.ocr_preview_source.as_deref() else {
             return;
         };
+        if let Ok((width, height)) = image::image_dimensions(path) {
+            self.ocr_preset_key = format!("{width}x{height}");
+            if let Some(preset) = self.ocr_presets.get(&self.ocr_preset_key).copied() {
+                self.custom_ocr_crop = preset.crop;
+                self.ocr_preprocess = preset.preprocess;
+            }
+        }
         match load_image_preview(path) {
             Ok(image) => {
                 self.ocr_preview = Some(ctx.load_texture(
@@ -1114,6 +1376,37 @@ impl CompanionApp {
         let _ = store.set_preference("ocr.crop.top", &crop.top.to_string());
         let _ = store.set_preference("ocr.crop.width", &crop.width.to_string());
         let _ = store.set_preference("ocr.crop.height", &crop.height.to_string());
+        let _ = store.set_preference(
+            "ocr.preprocess.grayscale",
+            bool_text(self.ocr_preprocess.grayscale),
+        );
+        let _ = store.set_preference(
+            "ocr.preprocess.contrast",
+            &self.ocr_preprocess.contrast.to_string(),
+        );
+        let _ = store.set_preference(
+            "ocr.preprocess.scale",
+            &self.ocr_preprocess.scale.to_string(),
+        );
+        if let Ok(data) = serde_json::to_string(&self.ocr_presets) {
+            let _ = store.set_preference("ocr.presets", &data);
+        }
+    }
+
+    fn save_ocr_preset(&mut self) {
+        if self.ocr_preset_key.is_empty() {
+            self.ocr_status = "Choose a calibration screenshot before saving a preset".into();
+            return;
+        }
+        self.ocr_presets.insert(
+            self.ocr_preset_key.clone(),
+            OcrCalibrationPreset {
+                crop: self.custom_ocr_crop.normalized(),
+                preprocess: self.ocr_preprocess,
+            },
+        );
+        self.save_custom_crop();
+        self.ocr_status = format!("Saved OCR preset for {}", self.ocr_preset_key);
     }
 
     fn start_screenshot_ocr(&mut self, path: PathBuf) {
@@ -1122,10 +1415,15 @@ impl CompanionApp {
         }
         self.ocr_status = format!("Reading {} locally…", path.display());
         let region = self.capture_region;
-        let custom_crop = self.custom_ocr_crop;
+        let (custom_crop, preprocess) = image::image_dimensions(&path)
+            .ok()
+            .and_then(|(width, height)| self.ocr_presets.get(&format!("{width}x{height}")))
+            .map_or((self.custom_ocr_crop, self.ocr_preprocess), |preset| {
+                (preset.crop, preset.preprocess)
+            });
         let (sender, receiver) = mpsc::channel();
         std::thread::spawn(move || {
-            let result = run_tesseract(&path, region, custom_crop);
+            let result = run_tesseract(&path, region, custom_crop, preprocess);
             let _ = sender.send(result);
         });
         self.ocr_receiver = Some(receiver);
@@ -1146,11 +1444,20 @@ impl CompanionApp {
             std::process::id()
         ));
         let custom_crop = self.custom_ocr_crop;
+        let preprocess = self.ocr_preprocess;
+        let presets = self.ocr_presets.clone();
         let (sender, receiver) = mpsc::channel();
         std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_millis(650));
-            let result = capture_current_screen(&path)
-                .and_then(|()| run_tesseract(&path, region, custom_crop));
+            let result = capture_current_screen(&path).and_then(|()| {
+                let (crop, preprocessing) = image::image_dimensions(&path)
+                    .ok()
+                    .and_then(|(width, height)| presets.get(&format!("{width}x{height}")))
+                    .map_or((custom_crop, preprocess), |preset| {
+                        (preset.crop, preset.preprocess)
+                    });
+                run_tesseract(&path, region, crop, preprocessing)
+            });
             let _ = std::fs::remove_file(&path);
             let _ = sender.send(result);
         });
@@ -1613,9 +1920,33 @@ impl CompanionApp {
             self.push_hud_alert(text, important);
         }
         for trade in trades {
+            if self.trade_notifications {
+                send_local_trade_notification(&trade);
+            }
             self.live_trades.push_front(trade);
             self.live_trades.truncate(20);
         }
+    }
+
+    fn handle_trade(&mut self, trade: &TradeRequest, outcome: TradeOutcome) {
+        self.dismissed_trades.insert(trade.raw_message.clone());
+        let record = TradeHistoryRecord {
+            handled_at: chrono::Utc::now().to_rfc3339(),
+            buyer: trade.buyer.clone(),
+            item: trade.item.clone(),
+            price: trade.price.clone(),
+            location: trade.location.clone(),
+            outcome: match outcome {
+                TradeOutcome::Completed => "completed",
+                TradeOutcome::Dismissed => "dismissed",
+            }
+            .into(),
+        };
+        if let Some(store) = &self.store {
+            let _ = store.record_trade(&record);
+        }
+        self.trade_history.insert(0, record);
+        self.trade_history.truncate(250);
     }
 
     fn collect_ai(&mut self) {
@@ -1997,13 +2328,14 @@ impl CompanionApp {
             });
     }
 
-    fn trade(&self, ui: &mut egui::Ui) {
+    fn trade(&mut self, ui: &mut egui::Ui) {
         section_intro(ui, "Incoming requests", "Trade whispers detected from Client.txt. No messages or game actions are sent automatically.");
-        let trades: Vec<_> = self
-            .recent
+        let trades = self
+            .live_trades
             .iter()
-            .filter(|event| event.kind == EventKind::TradeWhisper)
-            .collect();
+            .filter(|trade| !self.dismissed_trades.contains(&trade.raw_message))
+            .cloned()
+            .collect::<Vec<_>>();
         if trades.is_empty() {
             empty_state(
                 ui,
@@ -2011,10 +2343,54 @@ impl CompanionApp {
                 "Start monitoring and incoming trade requests will be collected here.",
             );
         } else {
-            for event in trades {
-                event_row(ui, event);
+            let mut handled = None;
+            for trade in &trades {
+                trade_card(ui, trade, &mut handled);
+            }
+            if let Some((trade, outcome)) = handled {
+                self.handle_trade(&trade, outcome);
             }
         }
+        ui.add_space(16.0);
+        ui.horizontal_wrapped(|ui| {
+            ui.heading("Local trade history");
+            if ui
+                .checkbox(&mut self.trade_notifications, "Desktop notifications")
+                .changed()
+            {
+                if let Some(store) = &self.store {
+                    let _ = store
+                        .set_preference("trade.notifications", bool_text(self.trade_notifications));
+                }
+            }
+        });
+        ui.label(RichText::new("History and notifications stay on this computer. Replies are copied only when you click.").size(11.0).color(TEXT_MUTED));
+        egui::ScrollArea::vertical()
+            .max_height(300.0)
+            .show(ui, |ui| {
+                for record in self.trade_history.iter().take(100) {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.colored_label(
+                            if record.outcome == "completed" {
+                                SUCCESS
+                            } else {
+                                TEXT_MUTED
+                            },
+                            record.outcome.to_ascii_uppercase(),
+                        );
+                        ui.label(format!(
+                            "{} · {} · {} · {}",
+                            record.buyer, record.item, record.price, record.handled_at
+                        ));
+                    });
+                }
+                if self.trade_history.is_empty() {
+                    ui.label(
+                        RichText::new("Completed and dismissed requests appear here.")
+                            .color(TEXT_MUTED),
+                    );
+                }
+            });
     }
 
     fn character_page(&mut self, ui: &mut egui::Ui) {
@@ -2446,13 +2822,47 @@ impl CompanionApp {
                                     changed |= ui.add(egui::Slider::new(&mut self.custom_ocr_crop.height, 0.05..=1.0).custom_formatter(|value, _| format!("{:.0}%", value * 100.0))).changed();
                                     ui.end_row();
                                 });
+                            ui.separator();
+                            ui.label(RichText::new("TEXT PREPROCESSING").size(10.0).color(GOLD_DIM));
+                            changed |= ui
+                                .checkbox(&mut self.ocr_preprocess.grayscale, "Convert to grayscale")
+                                .changed();
+                            changed |= ui
+                                .add(
+                                    egui::Slider::new(
+                                        &mut self.ocr_preprocess.contrast,
+                                        -40.0..=80.0,
+                                    )
+                                    .text("Contrast"),
+                                )
+                                .changed();
+                            changed |= ui
+                                .add(
+                                    egui::Slider::new(&mut self.ocr_preprocess.scale, 1..=4)
+                                        .text("Text scale"),
+                                )
+                                .changed();
                             if changed {
                                 self.custom_ocr_crop = self.custom_ocr_crop.normalized();
                                 self.save_custom_crop();
                             }
-                            if ui.button("Choose calibration screenshot…").clicked() {
-                                self.choose_ocr_calibration_image(ui.ctx());
-                            }
+                            ui.horizontal_wrapped(|ui| {
+                                if ui.button("Choose calibration screenshot…").clicked() {
+                                    self.choose_ocr_calibration_image(ui.ctx());
+                                }
+                                if ui
+                                    .add_enabled(
+                                        !self.ocr_preset_key.is_empty(),
+                                        egui::Button::new("Save resolution preset"),
+                                    )
+                                    .clicked()
+                                {
+                                    self.save_ocr_preset();
+                                }
+                                if !self.ocr_preset_key.is_empty() {
+                                    ui.label(format!("Preset: {}", self.ocr_preset_key));
+                                }
+                            });
                             if let Some((texture_id, native_size)) = self
                                 .ocr_preview
                                 .as_ref()
@@ -3383,8 +3793,8 @@ impl CompanionApp {
                 for trade in trades {
                     trade_card(ui, &trade, &mut handled);
                 }
-                if let Some(message) = handled {
-                    self.dismissed_trades.insert(message);
+                if let Some((trade, outcome)) = handled {
+                    self.handle_trade(&trade, outcome);
                 }
                 for event in self
                     .recent
@@ -3515,9 +3925,15 @@ impl CompanionApp {
                     self.analyze_map_mods();
                 }
                 if ui.button("Save rules").clicked() {
-                    let value = self.map_risk_rules.clone();
-                    self.save_planner_text("planner.map_risks", &value);
-                    self.map_mod_status = "Danger phrases saved locally".into();
+                    self.persist_current_character();
+                    self.map_mod_status = format!(
+                        "Danger phrases saved for {}",
+                        character_display_name(&self.offline_character)
+                    );
+                }
+                if ui.button("Balanced preset").clicked() {
+                    self.map_risk_rules = "reflect\ncannot regenerate\nreduced recovery\nmaximum resistances\nless recovery".into();
+                    self.persist_current_character();
                 }
             });
             ui.label(RichText::new(&self.map_mod_status).color(
@@ -3551,11 +3967,44 @@ impl CompanionApp {
                 if ui.button("Analyze item").clicked() {
                     self.analyze_crafting_item();
                 }
+                if ui.button("Compare to equipped slot").clicked() {
+                    self.item_comparison =
+                        match parse_item_text(&self.item_slot, &self.crafting_input) {
+                            Ok(candidate) => self
+                                .offline_character
+                                .items
+                                .iter()
+                                .find(|item| item.slot == self.item_slot)
+                                .map_or_else(
+                                    || {
+                                        format!(
+                                            "No captured item in {} to compare against",
+                                            self.item_slot
+                                        )
+                                    },
+                                    |equipped| compare_captured_items(equipped, &candidate),
+                                ),
+                            Err(error) => error.to_string(),
+                        };
+                }
                 if ui.button("Save plan").clicked() {
                     let value = self.crafting_plan.clone();
                     self.save_planner_text("planner.crafting", &value);
                 }
             });
+            ui.horizontal(|ui| {
+                ui.label("Candidate slot");
+                egui::ComboBox::from_id_salt("crafting_candidate_slot")
+                    .selected_text(&self.item_slot)
+                    .show_ui(ui, |ui| {
+                        for slot in EQUIPMENT_SLOTS {
+                            ui.selectable_value(&mut self.item_slot, (*slot).to_string(), *slot);
+                        }
+                    });
+            });
+            if !self.item_comparison.is_empty() {
+                ui.label(RichText::new(&self.item_comparison).color(GOLD));
+            }
             ui.add(
                 egui::TextEdit::multiline(&mut self.crafting_plan)
                     .hint_text("Analysis, craft plan, and local notes…")
@@ -3639,6 +4088,58 @@ impl CompanionApp {
 
     fn progression_tool(&mut self, ui: &mut egui::Ui) {
         planner_frame(ui, "PROGRESSION CHECKLIST", |ui| {
+            ui.label(
+                RichText::new(format!(
+                    "Saved separately for {}",
+                    character_display_name(&self.offline_character)
+                ))
+                .size(10.0)
+                .color(TEXT_MUTED),
+            );
+            let mut changed = false;
+            let mut milestones = vec![
+                "Merciless Lab",
+                "Uber Lab",
+                "Four Voidstones",
+                "Five-slot Map Device",
+                "Maven Invitations",
+                "Favourite Map Slots",
+                "Major Pantheons",
+                "Minor Pantheons",
+                "Pinnacle Bosses",
+            ]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+            if let Some(pack) = &self.local_data_pack {
+                milestones.extend(pack.bosses.iter().map(|name| format!("Boss: {name}")));
+                milestones.extend(
+                    pack.pantheons
+                        .iter()
+                        .map(|name| format!("Pantheon: {name}")),
+                );
+            }
+            milestones.sort();
+            milestones.dedup();
+            for milestone in milestones {
+                let mut complete = self
+                    .offline_character
+                    .progression
+                    .get(&milestone)
+                    .copied()
+                    .unwrap_or(false);
+                if ui.checkbox(&mut complete, &milestone).changed() {
+                    self.offline_character
+                        .progression
+                        .insert(milestone, complete);
+                    changed = true;
+                }
+            }
+            if changed {
+                self.persist_current_character();
+            }
+            ui.separator();
+            ui.label(RichText::new("CAPTURE COVERAGE").size(10.0).color(GOLD));
             for (complete, label) in progression_checklist(&self.offline_character) {
                 ui.colored_label(
                     if complete { SUCCESS } else { GOLD },
@@ -3646,6 +4147,8 @@ impl CompanionApp {
                 );
             }
             ui.separator();
+            ui.label(RichText::new("DEFENSIVE COVERAGE").size(10.0).color(GOLD));
+            ui.label(captured_defense_summary(&self.offline_character));
             let assessment = assess_character(&self.offline_character);
             for (label, covered) in &assessment.coverage {
                 ui.colored_label(
@@ -3698,8 +4201,24 @@ impl CompanionApp {
         section_intro(
             ui,
             "Client integration",
-            "The companion only reads the log file you select.",
+            "No sign-in, OAuth, API key, POESESSID, or account credentials are used.",
         );
+        if !self.setup_complete {
+            egui::Frame::new().fill(Color32::from_rgb(40, 33, 23)).stroke(Stroke::new(1.0, GOLD_DIM)).inner_margin(18.0).corner_radius(5.0).show(ui, |ui| {
+                ui.label(RichText::new("FIRST-RUN LOCAL SETUP").color(GOLD).strong());
+                ui.label("1. Select Client.txt  ·  2. Confirm local SQLite  ·  3. Test screenshot OCR  ·  4. Ollama is optional");
+                ui.horizontal_wrapped(|ui| {
+                    if ui.button("Choose Client.txt…").clicked() { self.choose_log(); }
+                    if ui.button("Run checks").clicked() { self.run_diagnostics(); }
+                    if ui.button("Finish setup").clicked() {
+                        self.setup_complete = true;
+                        if let Some(store) = &self.store { let _ = store.set_preference("setup.complete", "true"); }
+                    }
+                });
+                ui.label(RichText::new("Everything works from local files and user-triggered captures; no Path of Exile account connection is required.").size(11.0).color(TEXT_MUTED));
+            });
+            ui.add_space(14.0);
+        }
         egui::Frame::new()
             .fill(PANEL)
             .inner_margin(18.0)
@@ -3734,6 +4253,23 @@ impl CompanionApp {
                     )
                     .color(TEXT_MUTED),
                 );
+            });
+        ui.add_space(14.0);
+        egui::Frame::new()
+            .fill(PANEL)
+            .inner_margin(18.0)
+            .corner_radius(5.0)
+            .show(ui, |ui| {
+                ui.label(RichText::new("VERSIONED LOCAL POE DATA").size(11.0).color(GOLD).strong());
+                ui.label("Optional JSON packs add modifier rules, passive labels, maps, bosses, pantheons, gem tags, and crafting notes without a web service.");
+                ui.horizontal_wrapped(|ui| {
+                    if ui.button("Load data pack…").clicked() { self.choose_local_data_pack(); }
+                    if ui.button("Export starter template…").clicked() { self.export_local_data_pack_template(); }
+                });
+                ui.label(RichText::new(&self.local_data_pack_status).color(TEXT_MUTED));
+                if let Some(pack) = &self.local_data_pack {
+                    ui.label(format!("Format {} · {} passive nodes · {} gem entries · {} bosses", pack.format_version, pack.passive_nodes.len(), pack.gem_tags.len(), pack.bosses.len()));
+                }
             });
         ui.add_space(14.0);
         egui::Frame::new()
@@ -3870,14 +4406,22 @@ impl CompanionApp {
                 ui.label(RichText::new(&self.backup_status).color(TEXT_MUTED));
             });
         ui.add_space(14.0);
-        ui.label(
-            RichText::new(format!(
-                "Exile Companion v{} · This product isn't affiliated with or endorsed by Grinding Gear Games in any way.",
-                env!("CARGO_PKG_VERSION")
-            ))
-            .size(11.0)
-            .color(TEXT_MUTED),
-        );
+        egui::Frame::new().fill(PANEL).inner_margin(18.0).corner_radius(5.0).show(ui, |ui| {
+            ui.label(RichText::new("ABOUT AND UPDATES").size(11.0).color(GOLD).strong());
+            ui.label(format!("Exile Companion v{}", env!("CARGO_PKG_VERSION")));
+            ui.label(format!("Local database: {}", self.database_path.display()));
+            ui.horizontal_wrapped(|ui| {
+                if ui.add_enabled(self.update_receiver.is_none(), egui::Button::new("Check for updates")).clicked() { self.check_for_updates(); }
+                if self.update_status.contains("https://") && ui.button("Copy release page").clicked() {
+                    if let Some(url) = self.update_status.split_whitespace().find(|part| part.starts_with("https://")) {
+                        let _ = arboard::Clipboard::new().and_then(|mut clipboard| clipboard.set_text(url.to_string()));
+                    }
+                }
+            });
+            ui.label(RichText::new(&self.update_status).color(TEXT_MUTED));
+            ui.label(RichText::new("No sign-in or credentials. Manual update checks only read the public GitHub release version.").size(11.0).color(SUCCESS));
+            ui.label(RichText::new("This product isn't affiliated with or endorsed by Grinding Gear Games in any way.").size(11.0).color(TEXT_MUTED));
+        });
     }
 }
 
@@ -3911,6 +4455,7 @@ impl eframe::App for CompanionApp {
         self.collect();
         self.collect_ai();
         self.collect_ocr(ctx);
+        self.collect_update_check();
         self.poll_screenshot_folder();
         ctx.request_repaint_after(std::time::Duration::from_millis(250));
         if self.overlay_mode && self.compact_mode {
@@ -3951,7 +4496,9 @@ impl eframe::App for CompanionApp {
                     egui::ScrollArea::vertical().show(ui, |ui| self.character_page(ui));
                 }
                 Page::Assistant => self.assistant(ui),
-                Page::Trade => self.trade(ui),
+                Page::Trade => {
+                    egui::ScrollArea::vertical().show(ui, |ui| self.trade(ui));
+                }
                 Page::Tools => self.tools(ui),
                 Page::Settings => {
                     egui::ScrollArea::vertical().show(ui, |ui| self.settings(ui));
@@ -3964,12 +4511,17 @@ fn run_tesseract(
     path: &std::path::Path,
     region: CaptureRegion,
     custom_crop: OcrCrop,
+    preprocess: OcrPreprocess,
 ) -> Result<OcrResult, String> {
-    let cropped_path = (region != CaptureRegion::FullScreen).then(|| {
+    let needs_temporary_image = region != CaptureRegion::FullScreen
+        || preprocess.grayscale
+        || preprocess.contrast.abs() > f32::EPSILON
+        || preprocess.scale > 1;
+    let cropped_path = needs_temporary_image.then(|| {
         std::env::temp_dir().join(format!("exile-companion-ocr-crop-{}.png", new_profile_id()))
     });
     let target = if let Some(cropped) = &cropped_path {
-        crop_ocr_region(path, cropped, region, custom_crop)?;
+        crop_ocr_region(path, cropped, region, custom_crop, preprocess)?;
         cropped.as_path()
     } else {
         path
@@ -4065,6 +4617,7 @@ fn crop_ocr_region(
     target: &std::path::Path,
     region: CaptureRegion,
     custom_crop: OcrCrop,
+    preprocess: OcrPreprocess,
 ) -> Result<(), String> {
     use image::GenericImageView;
     let image =
@@ -4084,8 +4637,21 @@ fn crop_ocr_region(
             )
         }
     };
-    image
-        .crop_imm(x, y, crop_width.max(1), crop_height.max(1))
+    let mut processed = image.crop_imm(x, y, crop_width.max(1), crop_height.max(1));
+    if preprocess.grayscale {
+        processed = processed.grayscale();
+    }
+    if preprocess.contrast.abs() > f32::EPSILON {
+        processed = processed.adjust_contrast(preprocess.contrast);
+    }
+    if preprocess.scale > 1 {
+        processed = processed.resize(
+            processed.width().saturating_mul(preprocess.scale),
+            processed.height().saturating_mul(preprocess.scale),
+            image::imageops::FilterType::Lanczos3,
+        );
+    }
+    processed
         .save(target)
         .map_err(|error| format!("Could not prepare OCR region: {error}"))
 }
@@ -4562,7 +5128,7 @@ fn parse_passive_node_names(input: &str) -> Result<BTreeMap<u16, String>, String
     }
 }
 
-fn crafting_summary(input: &str) -> String {
+fn crafting_summary(input: &str, data_pack: Option<&LocalDataPack>) -> String {
     match parse_item_text("Craft target", input) {
         Ok(item) => {
             let recognized = [
@@ -4578,8 +5144,48 @@ fn crafting_summary(input: &str) -> String {
             .map(|(name, value)| format!("{name} {value:+}"))
             .collect::<Vec<_>>()
             .join(", ");
+            let lower = item.raw_text.to_ascii_lowercase();
+            let matched_rules = data_pack.map_or_else(Vec::new, |pack| {
+                pack.modifier_rules
+                    .iter()
+                    .filter(|rule| {
+                        !rule.pattern.trim().is_empty()
+                            && lower.contains(&rule.pattern.to_ascii_lowercase())
+                    })
+                    .map(|rule| {
+                        rule.desirable_minimum.map_or_else(
+                            || rule.label.clone(),
+                            |minimum| format!("{} (target {minimum}+)", rule.label),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            });
+            let (prefixes, suffixes) = advanced_affix_counts(&item.raw_text);
+            let affixes = if prefixes + suffixes == 0 {
+                "Affix slots: unknown from basic clipboard text".into()
+            } else {
+                format!(
+                    "Advanced affix markers: {prefixes} prefix(es), {suffixes} suffix(es) · estimated open slots: {}",
+                    6_usize.saturating_sub(prefixes + suffixes)
+                )
+            };
+            let pack_context = data_pack.map_or_else(
+                || "Data pack: none; tier and mod-group checks unavailable".into(),
+                |pack| {
+                    format!(
+                        "Data pack: {} / PoE {}\nMatched local rules: {}",
+                        pack.label,
+                        pack.poe_version,
+                        if matched_rules.is_empty() {
+                            "none".into()
+                        } else {
+                            matched_rules.join(", ")
+                        }
+                    )
+                },
+            );
             format!(
-                "Target: {} ({})\nRecognized values: {}\n\nPlan:\n1. Define the required final affixes.\n2. Confirm item level and influence in the copied text.\n3. Record each user-performed craft and its cost here.\n\nPrefix/suffix identity and crafting weights are not inferred from plain clipboard text.",
+                "Target: {} ({})\nRecognized values: {}\n{affixes}\n{pack_context}\n\nPlan:\n1. Define the required final affixes.\n2. Confirm item level and influence in the copied text.\n3. Record each user-performed craft and its cost here.\n\nCrafting weights are reported only when supplied by the visible versioned local pack.",
                 item.name,
                 item.base_type,
                 if recognized.is_empty() { "none" } else { &recognized }
@@ -4587,6 +5193,36 @@ fn crafting_summary(input: &str) -> String {
         }
         Err(error) => format!("Could not parse craft target: {error}"),
     }
+}
+
+fn advanced_affix_counts(input: &str) -> (usize, usize) {
+    input.lines().fold((0, 0), |(prefixes, suffixes), line| {
+        let lower = line.to_ascii_lowercase();
+        (
+            prefixes + usize::from(lower.contains("(prefix)")),
+            suffixes + usize::from(lower.contains("(suffix)")),
+        )
+    })
+}
+
+fn load_local_data_pack_path(path: &str) -> Result<LocalDataPack, String> {
+    if path.trim().is_empty() {
+        return Err("no local data-pack path configured".into());
+    }
+    let text = std::fs::read_to_string(path)
+        .map_err(|error| format!("Could not read local data pack: {error}"))?;
+    let pack = serde_json::from_str::<LocalDataPack>(&text)
+        .map_err(|error| format!("Invalid local data pack: {error}"))?;
+    if pack.format_version != 1 {
+        return Err(format!(
+            "Unsupported local data-pack format {} (expected 1)",
+            pack.format_version
+        ));
+    }
+    if pack.poe_version.trim().is_empty() || pack.label.trim().is_empty() {
+        return Err("Local data pack must declare label and poe_version".into());
+    }
+    Ok(pack)
 }
 
 fn validate_loot_filter(filter: &str) -> String {
@@ -4802,6 +5438,14 @@ fn captured_defense_summary(character: &OfflineCharacter) -> String {
         "Cold Resistance",
         "Lightning Resistance",
         "Chaos Resistance",
+        "Armour",
+        "Evasion Rating",
+        "Spell Suppression Chance",
+        "Attack Block Chance",
+        "Spell Block Chance",
+        "Physical Damage Reduction",
+        "Life Regeneration",
+        "Elemental Ailment Avoidance",
     ];
     let values = wanted
         .iter()
@@ -4830,7 +5474,11 @@ fn format_duration(duration: std::time::Duration) -> String {
     }
 }
 
-fn trade_card(ui: &mut egui::Ui, trade: &TradeRequest, handled: &mut Option<String>) {
+fn trade_card(
+    ui: &mut egui::Ui,
+    trade: &TradeRequest,
+    handled: &mut Option<(TradeRequest, TradeOutcome)>,
+) {
     egui::Frame::new()
         .fill(Color32::from_rgb(26, 34, 43))
         .stroke(Stroke::new(1.0, Color32::from_rgb(78, 119, 157)))
@@ -4859,12 +5507,42 @@ fn trade_card(ui: &mut egui::Ui, trade: &TradeRequest, handled: &mut Option<Stri
                 }
                 let complete = ui.small_button("Complete").clicked();
                 let dismiss = ui.small_button("Dismiss").clicked();
-                if complete || dismiss {
-                    *handled = Some(trade.raw_message.clone());
+                if complete {
+                    *handled = Some((trade.clone(), TradeOutcome::Completed));
+                } else if dismiss {
+                    *handled = Some((trade.clone(), TradeOutcome::Dismissed));
                 }
             });
         });
     ui.add_space(5.0);
+}
+
+fn send_local_trade_notification(trade: &TradeRequest) {
+    let title = "Exile Companion trade";
+    let message = format!("{} wants {} for {}", trade.buyer, trade.item, trade.price);
+    #[cfg(target_os = "linux")]
+    {
+        let _ = std::process::Command::new("notify-send")
+            .args([title, &message])
+            .spawn();
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let escaped = message.replace('\'', "''");
+        let script = format!(
+            "Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.NotifyIcon]::new() | ForEach-Object {{ $_.Icon=[System.Drawing.SystemIcons]::Information; $_.BalloonTipTitle='{title}'; $_.BalloonTipText='{escaped}'; $_.Visible=$true; $_.ShowBalloonTip(5000); Start-Sleep -Seconds 5; $_.Dispose() }}"
+        );
+        let _ = std::process::Command::new("powershell.exe")
+            .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+            .spawn();
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let script = format!("display notification {:?} with title {:?}", message, title);
+        let _ = std::process::Command::new("osascript")
+            .args(["-e", &script])
+            .spawn();
+    }
 }
 
 fn new_profile_id() -> String {
@@ -5250,7 +5928,7 @@ mod tests {
     #[test]
     fn crafting_summary_uses_copied_item_values() {
         let item = "Item Class: Rings\nRarity: Rare\nDoom Circle\nAmethyst Ring\n--------\n+70 to maximum Life\n+31% to Fire Resistance";
-        let summary = crafting_summary(item);
+        let summary = crafting_summary(item, None);
         assert!(summary.contains("Doom Circle"));
         assert!(summary.contains("life +70"));
         assert!(summary.contains("fire res +31"));
@@ -5321,6 +5999,10 @@ mod tests {
             loot_filter_text: "Show".into(),
             screenshot_watch_folder: String::new(),
             custom_crop: OcrCrop::default(),
+            trade_history: Vec::new(),
+            ocr_preprocess: OcrPreprocess::default(),
+            ocr_presets: BTreeMap::new(),
+            local_data_pack_path: String::new(),
         };
         let json = serde_json::to_string(&backup).unwrap();
         let restored: BackupBundle = serde_json::from_str(&json).unwrap();

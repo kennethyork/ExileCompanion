@@ -17,6 +17,7 @@ A native Windows/Linux Path of Exile companion written in Rust. The project is i
 - Active-character selector, live PoE/log indicators, session counters, and an explicit Exit control
 - Local smart alerts for trades, deaths, level-ups, OCR results, character changes, and Ollama completion
 - Structured trade cards with buyer, item, price, stash location, copy-reply, complete, and dismiss controls
+- Local trade completion history and optional operating-system notifications
 - Current-area and session timers calculated from local `Client.txt` events
 - Captured-defense freshness, missing-data guidance, and local equipment comparison summaries
 - OCR word-confidence scoring with review gates for uncertain or similar character names
@@ -50,13 +51,18 @@ A native Windows/Linux Path of Exile companion written in Rust. The project is i
 - Character progression checklist and passive-tree allocation ID inspection
 - Local loot-filter editor, structural checks, and `.filter` export
 - Full-screen, center-panel, and top-center OCR crop presets for more reliable capture
+- Resolution-specific OCR calibration presets with grayscale, contrast, and local text upscaling
+- Per-character map-risk profiles and editable Atlas/boss progression milestones
+- Versioned, user-supplied local PoE JSON data packs for modifier rules, passives, gems, maps, bosses, and pantheons
+- Defensive coverage dashboard for captured armour/evasion, suppression, block, recovery, ailments, and resistances
+- Local candidate-item comparison against the captured equipped slot
 - Guided five-source Capture Center with persisted timestamps and OCR confidence per character
 - Custom percentage-based OCR crop calibration with a local image preview
 - Optional local passive-tree JSON loading to resolve allocated node IDs into names
 - Map-run averages, deathless rate, complete local history, and CSV export
 - Complete JSON backup/merge restore for characters, snapshots, map runs, planners, filters, and crop settings
 - First-run diagnostics for Client.txt, SQLite, Tesseract, screenshot folders, and optional Ollama
-- Local panic log viewer and version information
+- Guided first-run local setup, manual public-GitHub update check, local panic log viewer, and version/database information
 - Session counters and recent-event feed
 - Explicit policy boundary: no game-input, memory-reading, packet, or unattended automation modules
 
@@ -77,6 +83,8 @@ ollama pull qwen3.5:2b
 On Linux, eframe may require the normal X11/Wayland development packages supplied by your distribution. The database is saved under the platform data directory when available, otherwise beside the executable.
 
 The app initially guesses common log paths. Use **Select Client.txt** to choose the correct file. For Steam/Proton this is typically inside the relevant Steam compatibility prefix.
+
+Exile Companion never asks users to sign in. It does not use OAuth, API keys, `POESESSID`, Path of Exile credentials, or an Exile Companion account. Character data comes from user-triggered screenshots/clipboard actions and local files. The optional Ollama connection is restricted to localhost.
 
 To load character information without an API key, open **Character** and either use the fully in-app capture workflow or, optionally, paste a Path of Building export code/select a saved PoB XML file. Web build links are not downloaded. Imports are parsed locally and do not disable `Client.txt` monitoring.
 
@@ -108,7 +116,9 @@ Screenshot recognition uses Tesseract locally and never uploads images. Windows 
 
 ## Local competitive toolkit
 
-Open **Tools** for the map-mod checker, crafting worksheet, map-run journal, progression checklist, and loot-filter editor. The map checker can capture the top-center of the game screen with the same local OCR pipeline used by character capture. Risk phrases, craft notes, and filter text are kept in the local SQLite preferences; completed map runs are stored in their own local table.
+Open **Tools** for the map-mod checker, crafting/upgrade worksheet, map-run journal, progression checklist, defensive coverage, and loot-filter editor. The map checker can capture the top-center of the game screen with the same local OCR pipeline used by character capture. Risk phrases are stored per character; craft notes, filters, progression, completed map runs, and trade history stay local.
+
+Settings can load an optional versioned local data-pack JSON or export a starter template. Packs are ordinary readable files, require no network access, and can supply modifier patterns, passive labels, gem tags, map/boss/pantheon lists, and crafting notes. Update checks are manual and read only the public GitHub release endpoint.
 
 The build assessment and upgrade comparison deliberately use only values the app actually captured. They do not reproduce Path of Building's combat simulation, infer hidden passive effects, download current affix/price data, or claim exact DPS from incomplete screenshots. This keeps the no-login workflow private and makes uncertain data visible instead of fabricating precision.
 
@@ -119,6 +129,8 @@ The progression review also checks captured gems for movement, guard, aura/reser
 Use **Settings → Backup and restore** to export a readable local JSON backup or merge one into the current installation. SQLite itself is compiled into the application, and the schema/database file is created automatically in the current user's private application-data directory. Existing working-directory databases are migrated on first launch. Settings also contains setup diagnostics, the exact database path, and any locally written panic log.
 
 Tagged releases and manually dispatched GitHub Actions build a Linux AppImage and a Windows NSIS installer with `cargo-packager`. Both packages carry an offline English Tesseract runtime/data set, and the workflow runs the complete test suite before packaging.
+
+Windows Authenticode signing is supported when repository secrets `WINDOWS_CERTIFICATE_BASE64` (base64 PFX contents) and `WINDOWS_CERTIFICATE_PASSWORD` are configured. Without them, the same workflow explicitly produces an unsigned installer. No signing material is stored in the repository.
 
 ## Test
 

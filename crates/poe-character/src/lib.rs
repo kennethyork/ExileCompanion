@@ -86,6 +86,10 @@ pub struct OfflineCharacter {
     pub freshness: CaptureFreshness,
     #[serde(default)]
     pub ollama_review: String,
+    #[serde(default)]
+    pub map_risk_rules: String,
+    #[serde(default)]
+    pub progression: BTreeMap<String, bool>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -373,6 +377,24 @@ pub fn assess_character(character: &OfflineCharacter) -> LocalBuildAssessment {
                 .iter()
                 .any(|tag| tag == "curse" || tag == "hex" || tag == "mark"),
         ),
+        (
+            "Positive armour or evasion".into(),
+            sheet_number(character, "Armour").unwrap_or_default() > 0
+                || sheet_number(character, "Evasion").unwrap_or_default() > 0,
+        ),
+        (
+            "Spell suppression capped".into(),
+            sheet_number(character, "Spell Suppression Chance").unwrap_or_default() >= 100,
+        ),
+        (
+            "Attack or spell block captured".into(),
+            sheet_number(character, "Attack Block Chance").unwrap_or_default() > 0
+                || sheet_number(character, "Spell Block Chance").unwrap_or_default() > 0,
+        ),
+        (
+            "Elemental ailment avoidance capped".into(),
+            sheet_number(character, "Elemental Ailment Avoidance").unwrap_or_default() >= 100,
+        ),
     ];
     LocalBuildAssessment {
         captured_life,
@@ -401,6 +423,24 @@ pub fn parse_character_sheet_text(input: &str) -> Result<BTreeMap<String, String
         ("Cast Speed", r"Casts?\s+per\s+Second"),
         ("Critical Strike Chance", r"Critical\s+Strike\s+Chance"),
         ("Movement Speed", r"Movement\s+Speed"),
+        ("Spell Suppression Chance", r"Spell\s+Suppression\s+Chance"),
+        (
+            "Attack Block Chance",
+            r"Chance\s+to\s+Block\s+Attack\s+Damage",
+        ),
+        (
+            "Spell Block Chance",
+            r"Chance\s+to\s+Block\s+Spell\s+Damage",
+        ),
+        (
+            "Physical Damage Reduction",
+            r"Physical\s+Damage\s+Reduction",
+        ),
+        ("Life Regeneration", r"Life\s+Regeneration"),
+        (
+            "Elemental Ailment Avoidance",
+            r"Avoid(?:ance)?\s+of\s+Elemental\s+Ailments",
+        ),
     ];
     let mut stats = BTreeMap::new();
     for line in input.lines().map(str::trim).filter(|line| !line.is_empty()) {

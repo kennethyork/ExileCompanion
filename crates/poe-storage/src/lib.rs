@@ -30,6 +30,16 @@ pub struct MapRunRecord {
     pub loot: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TradeHistoryRecord {
+    pub handled_at: String,
+    pub buyer: String,
+    pub item: String,
+    pub price: String,
+    pub location: String,
+    pub outcome: String,
+}
+
 impl EventStore {
     pub fn open(path: &Path) -> Result<Self> {
         let connection = Connection::open(path)?;
@@ -64,6 +74,15 @@ impl EventStore {
                 deaths INTEGER NOT NULL,
                 investment TEXT NOT NULL,
                 loot TEXT NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS trade_history (
+                id INTEGER PRIMARY KEY,
+                handled_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                buyer TEXT NOT NULL,
+                item TEXT NOT NULL,
+                price TEXT NOT NULL,
+                location TEXT NOT NULL,
+                outcome TEXT NOT NULL
              );",
         )?;
         Ok(Self(connection))
@@ -184,6 +203,40 @@ impl EventStore {
         })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
+
+    pub fn record_trade(&self, trade: &TradeHistoryRecord) -> Result<()> {
+        self.0.execute(
+            "INSERT INTO trade_history (handled_at, buyer, item, price, location, outcome)
+             VALUES (CASE WHEN ?1 = '' THEN CURRENT_TIMESTAMP ELSE ?1 END, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                &trade.handled_at,
+                &trade.buyer,
+                &trade.item,
+                &trade.price,
+                &trade.location,
+                &trade.outcome
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn trade_history(&self, limit: usize) -> Result<Vec<TradeHistoryRecord>> {
+        let mut statement = self.0.prepare(
+            "SELECT handled_at, buyer, item, price, location, outcome
+             FROM trade_history ORDER BY id DESC LIMIT ?1",
+        )?;
+        let rows = statement.query_map([limit.min(1_000) as i64], |row| {
+            Ok(TradeHistoryRecord {
+                handled_at: row.get(0)?,
+                buyer: row.get(1)?,
+                item: row.get(2)?,
+                price: row.get(3)?,
+                location: row.get(4)?,
+                outcome: row.get(5)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
 }
 
 #[cfg(test)]
@@ -249,5 +302,23 @@ mod tests {
         let runs = store.map_runs(10).unwrap();
         assert_eq!(runs[0].area, "Dunes");
         assert_eq!(runs[0].duration_seconds, 123);
+    }
+
+    #[test]
+    fn stores_trade_history() {
+        let store = EventStore::open(Path::new(":memory:")).unwrap();
+        store
+            .record_trade(&TradeHistoryRecord {
+                handled_at: String::new(),
+                buyer: "Buyer".into(),
+                item: "Item".into(),
+                price: "5 chaos".into(),
+                location: "tab Left; position (1, 2)".into(),
+                outcome: "completed".into(),
+            })
+            .unwrap();
+        let history = store.trade_history(10).unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].outcome, "completed");
     }
 }

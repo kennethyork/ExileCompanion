@@ -55,6 +55,29 @@ jobs:
       - name: Build package
         working-directory: crates/poe-app
         run: cargo packager --release --formats ${{ matrix.format }}
+      - name: Sign Windows installer when certificate secrets are configured
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          WINDOWS_CERTIFICATE_BASE64: ${{ secrets.WINDOWS_CERTIFICATE_BASE64 }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:WINDOWS_CERTIFICATE_BASE64)) {
+            Write-Host "No signing certificate configured; publishing an unsigned installer."
+            exit 0
+          }
+          $certificate = Join-Path $env:RUNNER_TEMP "exile-companion-signing.pfx"
+          [IO.File]::WriteAllBytes($certificate, [Convert]::FromBase64String($env:WINDOWS_CERTIFICATE_BASE64))
+          $installer = Get-ChildItem "target/release/*-setup.exe" | Select-Object -First 1
+          if ($null -eq $installer) { throw "Windows installer was not found" }
+          $signtool = Get-Command signtool.exe -ErrorAction SilentlyContinue
+          if ($null -eq $signtool) {
+            $signtool = Get-ChildItem "${env:ProgramFiles(x86)}/Windows Kits/10/bin/*/x64/signtool.exe" | Sort-Object FullName -Descending | Select-Object -First 1
+          }
+          if ($null -eq $signtool) { throw "signtool.exe was not found" }
+          & $signtool sign /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 /f $certificate /p $env:WINDOWS_CERTIFICATE_PASSWORD $installer.FullName
+          if ($LASTEXITCODE -ne 0) { throw "Authenticode signing failed" }
+          Remove-Item $certificate -Force
       - name: Upload package
         uses: actions/upload-artifact@v4
         with:
