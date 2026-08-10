@@ -353,6 +353,8 @@ struct CompanionApp {
     ocr_text: String,
     ocr_status: String,
     ocr_receiver: Option<Receiver<Result<OcrResult, String>>>,
+    ocr_benchmark_receiver: Option<Receiver<Result<OcrResult, String>>>,
+    ocr_benchmark_result: String,
     ocr_confidence: Option<f32>,
     ocr_needs_review: bool,
     last_character_capture: Option<std::time::Instant>,
@@ -429,6 +431,8 @@ struct CompanionApp {
     update_receiver: Option<Receiver<Result<ReleaseInfo, String>>>,
     market_league: String,
     market_query: String,
+    market_item_input: String,
+    market_item_evaluation: String,
     market_cache: MarketCache,
     market_status: String,
     market_receiver: Option<Receiver<Result<MarketCache, String>>>,
@@ -594,6 +598,10 @@ impl CompanionApp {
             ocr_text: String::new(),
             ocr_status: "Select a character-sheet screenshot or paste OCR text".into(),
             ocr_receiver: None,
+            ocr_benchmark_receiver: None,
+            ocr_benchmark_result:
+                "Choose a calibration screenshot to test OCR without importing character data"
+                    .into(),
             ocr_confidence: None,
             ocr_needs_review: false,
             last_character_capture: None,
@@ -672,6 +680,8 @@ impl CompanionApp {
             update_receiver: None,
             market_league,
             market_query: String::new(),
+            market_item_input: String::new(),
+            market_item_evaluation: String::new(),
             market_cache,
             market_status,
             market_receiver: None,
@@ -1056,6 +1066,47 @@ impl CompanionApp {
             },
         };
         self.diagnostics.push(ollama);
+    }
+
+    fn export_redacted_support_report(&mut self) {
+        let Some(path) = rfd::FileDialog::new()
+            .set_title("Export redacted Exile Companion support report")
+            .add_filter("JSON", &["json"])
+            .set_file_name("ExileCompanion-support-report.json")
+            .save_file()
+        else {
+            return;
+        };
+        let runtime = tesseract_runtime();
+        let report = serde_json::json!({
+            "app_version": env!("CARGO_PKG_VERSION"),
+            "operating_system": std::env::consts::OS,
+            "architecture": std::env::consts::ARCH,
+            "client_log_selected": std::path::Path::new(self.log_path.trim()).is_file(),
+            "sqlite_ready": self.store.is_some(),
+            "ocr_runtime_bundled": runtime.bundled,
+            "ocr_preset_count": self.ocr_presets.len(),
+            "saved_character_count": self.characters.len(),
+            "saved_map_run_count": self.map_runs.len(),
+            "saved_trade_count": self.trade_history.len(),
+            "market_source": self.market_cache.source,
+            "market_league": self.market_cache.league,
+            "market_fetched_at": self.market_cache.fetched_at,
+            "market_price_count": self.market_cache.prices.len(),
+            "local_data_pack": self.local_data_pack.as_ref().map(|pack| serde_json::json!({
+                "label": pack.label,
+                "poe_version": pack.poe_version,
+                "format_version": pack.format_version,
+            })),
+            "privacy": "No paths, character names, item text, chat, Client.txt contents, screenshots, or Ollama prompts are included."
+        });
+        self.backup_status = match serde_json::to_string_pretty(&report)
+            .map_err(|error| error.to_string())
+            .and_then(|data| std::fs::write(&path, data).map_err(|error| error.to_string()))
+        {
+            Ok(()) => format!("Redacted support report exported to {}", path.display()),
+            Err(error) => format!("Support report export failed: {error}"),
+        };
     }
 
     fn check_for_updates(&mut self) {
@@ -1528,6 +1579,45 @@ impl CompanionApp {
         );
         self.save_custom_crop();
         self.ocr_status = format!("Saved OCR preset for {}", self.ocr_preset_key);
+    }
+
+    fn test_ocr_calibration(&mut self) {
+        if self.ocr_benchmark_receiver.is_some() {
+            return;
+        }
+        let Some(path) = self.ocr_preview_source.clone() else {
+            self.ocr_benchmark_result = "Choose a calibration screenshot first".into();
+            return;
+        };
+        self.ocr_benchmark_result = "Testing this preset locally without importing data…".into();
+        let region = CaptureRegion::Custom;
+        let crop = self.custom_ocr_crop;
+        let preprocess = self.ocr_preprocess;
+        let (sender, receiver) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = sender.send(run_tesseract(&path, region, crop, preprocess));
+        });
+        self.ocr_benchmark_receiver = Some(receiver);
+    }
+
+    fn collect_ocr_benchmark(&mut self) {
+        let Some(receiver) = &self.ocr_benchmark_receiver else {
+            return;
+        };
+        if let Ok(result) = receiver.try_recv() {
+            self.ocr_benchmark_result = match result {
+                Ok(result) => format!(
+                    "Confidence: {}\nRecognized text (not imported):\n{}",
+                    result.confidence.map_or_else(
+                        || "not reported".into(),
+                        |confidence| format!("{confidence:.1}%")
+                    ),
+                    result.text
+                ),
+                Err(error) => format!("OCR preset test failed: {error}"),
+            };
+            self.ocr_benchmark_receiver = None;
+        }
     }
 
     fn start_screenshot_ocr(&mut self, path: PathBuf) {
@@ -3038,10 +3128,32 @@ impl CompanionApp {
                                 {
                                     self.save_ocr_preset();
                                 }
+                                if ui
+                                    .add_enabled(
+                                        self.ocr_preview_source.is_some()
+                                            && self.ocr_benchmark_receiver.is_none(),
+                                        egui::Button::new("Test OCR without importing"),
+                                    )
+                                    .clicked()
+                                {
+                                    self.test_ocr_calibration();
+                                }
+                                if self.ocr_benchmark_receiver.is_some() {
+                                    ui.spinner();
+                                }
                                 if !self.ocr_preset_key.is_empty() {
                                     ui.label(format!("Preset: {}", self.ocr_preset_key));
                                 }
                             });
+                            egui::CollapsingHeader::new("OCR accuracy test result")
+                                .show(ui, |ui| {
+                                    ui.add(
+                                        egui::TextEdit::multiline(&mut self.ocr_benchmark_result)
+                                            .desired_rows(6)
+                                            .desired_width(f32::INFINITY)
+                                            .interactive(false),
+                                    );
+                                });
                             if let Some((texture_id, native_size)) = self
                                 .ocr_preview
                                 .as_ref()
@@ -4418,6 +4530,48 @@ impl CompanionApp {
                     .size(11.0)
                     .color(TEXT_MUTED),
             );
+            if let Some(warning) = market_cache_freshness_warning(&self.market_cache) {
+                ui.label(RichText::new(warning).color(GOLD));
+            }
+            egui::CollapsingHeader::new("Explain a copied item")
+                .default_open(false)
+                .show(ui, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        if ui.button("Read clipboard").clicked() {
+                            match arboard::Clipboard::new()
+                                .and_then(|mut clipboard| clipboard.get_text())
+                            {
+                                Ok(text) => self.market_item_input = text,
+                                Err(error) => {
+                                    self.market_item_evaluation =
+                                        format!("Could not read clipboard: {error}")
+                                }
+                            }
+                        }
+                        if ui
+                            .add_enabled(
+                                !self.market_item_input.trim().is_empty(),
+                                egui::Button::new("Evaluate transparently"),
+                            )
+                            .clicked()
+                        {
+                            self.market_item_evaluation = explain_copied_item(
+                                &self.market_item_input,
+                                self.local_data_pack.as_ref(),
+                                &self.market_cache,
+                            );
+                        }
+                    });
+                    ui.add(
+                        egui::TextEdit::multiline(&mut self.market_item_input)
+                            .hint_text("Paste item text…")
+                            .desired_rows(4)
+                            .desired_width(f32::INFINITY),
+                    );
+                    if !self.market_item_evaluation.is_empty() {
+                        ui.label(&self.market_item_evaluation);
+                    }
+                });
             ui.add(
                 egui::TextEdit::singleline(&mut self.market_query)
                     .hint_text("Search currency, unique, gem, map…")
@@ -4656,6 +4810,10 @@ impl CompanionApp {
                 if ui.button("Run all checks").clicked() {
                     self.run_diagnostics();
                 }
+                if ui.button("Export redacted support report…").clicked() {
+                    self.export_redacted_support_report();
+                }
+                ui.label(RichText::new("The report excludes paths, names, item text, chat/log contents, screenshots, and AI prompts.").size(10.0).color(TEXT_MUTED));
                 for check in &self.diagnostics {
                     ui.horizontal_wrapped(|ui| {
                         ui.colored_label(
@@ -4689,6 +4847,13 @@ impl CompanionApp {
                 });
                 ui.label(RichText::new(&self.backup_status).color(TEXT_MUTED));
             });
+        ui.add_space(14.0);
+        egui::Frame::new().fill(PANEL).inner_margin(18.0).corner_radius(5.0).show(ui, |ui| {
+            ui.label(RichText::new("PRIVACY AND NETWORK BOUNDARIES").size(11.0).color(GOLD).strong());
+            ui.label("Local by default · no telemetry · no account · no credential storage");
+            ui.label("Network access occurs only when you click: GitHub update check or poe.ninja market refresh.");
+            ui.label("Ollama requests are restricted to localhost. Screenshots, Client.txt, character data, and SQLite records are never uploaded by the app.");
+        });
         ui.add_space(14.0);
         egui::Frame::new().fill(PANEL).inner_margin(18.0).corner_radius(5.0).show(ui, |ui| {
             ui.label(RichText::new("ABOUT AND UPDATES").size(11.0).color(GOLD).strong());
@@ -4739,6 +4904,7 @@ impl eframe::App for CompanionApp {
         self.collect();
         self.collect_ai();
         self.collect_ocr(ctx);
+        self.collect_ocr_benchmark();
         self.collect_update_check();
         self.collect_market_snapshot();
         self.poll_screenshot_folder();
@@ -5371,6 +5537,12 @@ fn fetch_public_market_snapshot(league: &str) -> Result<MarketCache, String> {
         "UniqueFlask",
         "SkillGem",
         "Map",
+        "BaseType",
+        "DivinationCard",
+        "Scarab",
+        "Essence",
+        "Fossil",
+        "Oil",
     ] {
         if let Err(error) = fetch_market_category(
             &client,
@@ -5932,6 +6104,85 @@ fn captured_defense_contribution_index(item: &CapturedItem) -> i32 {
         + bonuses.cold_resistance / 3
         + bonuses.lightning_resistance / 3
         + bonuses.chaos_resistance / 2
+}
+
+fn market_cache_freshness_warning(cache: &MarketCache) -> Option<String> {
+    if cache.prices.is_empty() {
+        return None;
+    }
+    let fetched = chrono::DateTime::parse_from_rfc3339(&cache.fetched_at).ok()?;
+    let age = chrono::Utc::now().signed_duration_since(fetched.with_timezone(&chrono::Utc));
+    if age.num_hours() >= 48 {
+        Some(format!(
+            "Snapshot is {} days old; refresh before making expensive decisions",
+            age.num_days().max(2)
+        ))
+    } else if age.num_hours() >= 12 {
+        Some(format!(
+            "Snapshot is {} hours old; prices may have moved",
+            age.num_hours()
+        ))
+    } else {
+        None
+    }
+}
+
+fn explain_copied_item(
+    input: &str,
+    data_pack: Option<&LocalDataPack>,
+    market: &MarketCache,
+) -> String {
+    let item = match parse_item_text("Candidate", input) {
+        Ok(item) => item,
+        Err(error) => return format!("Could not parse item: {error}"),
+    };
+    let lower = item.raw_text.to_ascii_lowercase();
+    let matched_rules = data_pack.map_or_else(Vec::new, |pack| {
+        pack.modifier_rules
+            .iter()
+            .filter(|rule| {
+                !rule.pattern.trim().is_empty()
+                    && lower.contains(&rule.pattern.to_ascii_lowercase())
+            })
+            .map(|rule| rule.label.clone())
+            .collect::<Vec<_>>()
+    });
+    let exact = market
+        .prices
+        .iter()
+        .find(|price| price.name.eq_ignore_ascii_case(&item.name));
+    let base = market
+        .prices
+        .iter()
+        .find(|price| price.name.eq_ignore_ascii_case(&item.base_type));
+    let market_text = if item.rarity.eq_ignore_ascii_case("unique") {
+        exact.map_or_else(
+            || "No exact unique snapshot match".into(),
+            |price| format!("Exact-name snapshot: {:.2} chaos", price.chaos_value),
+        )
+    } else {
+        base.map_or_else(
+            || "No base-type snapshot match; no price estimated".into(),
+            |price| {
+                format!(
+                    "Base-type snapshot: {:.2} chaos; this is not a valuation of the rare item's modifiers",
+                    price.chaos_value
+                )
+            },
+        )
+    };
+    let (prefixes, suffixes) = advanced_affix_counts(&item.raw_text);
+    format!(
+        "{} · {} · {}\nCaptured-defense contribution index: {}\nMatched local target rules: {}\nAdvanced affix markers: {} prefix / {} suffix\n{}\nConfidence boundary: offence, rolls, tiers, influences, special mechanics, and demand are not inferred.",
+        item.name,
+        item.base_type,
+        item.rarity,
+        captured_defense_contribution_index(&item),
+        if matched_rules.is_empty() { "none".into() } else { matched_rules.join(", ") },
+        prefixes,
+        suffixes,
+        market_text,
+    )
 }
 
 fn character_capture_freshness(captured: Option<std::time::Instant>) -> String {
@@ -6599,5 +6850,30 @@ mod tests {
         let pack = builtin_local_data_pack().unwrap();
         assert_eq!(pack.format_version, 1);
         assert!(!pack.modifier_rules.is_empty());
+    }
+
+    #[test]
+    fn warns_about_stale_market_data_and_explains_rare_limits() {
+        let cache = MarketCache {
+            format_version: 1,
+            source: "fixture".into(),
+            league: "Standard".into(),
+            fetched_at: (chrono::Utc::now() - chrono::Duration::days(3)).to_rfc3339(),
+            prices: vec![MarketPrice {
+                name: "Amethyst Ring".into(),
+                category: "BaseType".into(),
+                chaos_value: 2.5,
+                divine_value: None,
+                listings: Some(20),
+            }],
+        };
+        assert!(market_cache_freshness_warning(&cache)
+            .unwrap()
+            .contains("3 days old"));
+        let item = "Item Class: Rings\nRarity: Rare\nDoom Circle\nAmethyst Ring\n--------\n+70 to maximum Life\n+31% to Fire Resistance";
+        let result = explain_copied_item(item, builtin_local_data_pack().as_ref(), &cache);
+        assert!(result.contains("Captured-defense contribution index"));
+        assert!(result.contains("not a valuation of the rare item's modifiers"));
+        assert!(result.contains("Maximum life"));
     }
 }

@@ -102,6 +102,8 @@ jobs:
           release_version="${GITHUB_REF_NAME#v}"
           mv dist/exile-companion-linux/poe-app_*_x86_64.AppImage "dist/ExileCompanion-${release_version}-x86_64.AppImage"
           mv dist/exile-companion-windows/poe-app_*_x64-setup.exe "dist/ExileCompanion-${release_version}-x64-setup.exe"
+          cd dist
+          sha256sum ExileCompanion-*.AppImage ExileCompanion-*-setup.exe > "ExileCompanion-${release_version}-SHA256SUMS.txt"
       - name: Publish GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -109,6 +111,7 @@ jobs:
           gh release create "$GITHUB_REF_NAME" \
             dist/ExileCompanion-*.AppImage \
             dist/ExileCompanion-*-setup.exe \
+            dist/ExileCompanion-*-SHA256SUMS.txt \
             --repo "$GITHUB_REPOSITORY" \
             --title "Exile Companion $GITHUB_REF_NAME" \
             --generate-notes

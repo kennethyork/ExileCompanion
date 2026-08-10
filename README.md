@@ -59,12 +59,16 @@ A native Windows/Linux Path of Exile companion written in Rust. The project is i
 - Transparent captured defensive-readiness score with a visible 100-point breakdown and explicit non-simulation limits
 - Local candidate-item comparison against the captured equipped slot
 - Optional user-triggered poe.ninja market snapshots, cached locally by league with searchable currency/unique/gem/map estimates
+- Broader snapshot coverage for base types, divination cards, scarabs, essences, fossils, and oils with stale-data warnings
+- Explainable copied-item review that separates exact unique estimates, base-type references, and unpriced rare modifiers
 - Guided five-source Capture Center with persisted timestamps and OCR confidence per character
 - Custom percentage-based OCR crop calibration with a local image preview
 - Optional local passive-tree JSON loading to resolve allocated node IDs into names
 - Map-run averages, deathless rate, complete local history, and CSV export
 - Complete JSON backup/merge restore for characters, snapshots, map runs, planners, filters, and crop settings
 - First-run diagnostics for Client.txt, SQLite, Tesseract, screenshot folders, and optional Ollama
+- Non-importing OCR accuracy bench for testing crop/preprocessing confidence safely
+- Redacted support-report export that excludes paths, names, item text, logs/chat, screenshots, and AI prompts
 - Guided first-run local setup, manual public-GitHub update check, local panic log viewer, and version/database information
 - Session counters and recent-event feed
 - Explicit policy boundary: no game-input, memory-reading, packet, or unattended automation modules
@@ -127,6 +131,8 @@ The bundled core pack is used automatically when no override is selected. The de
 
 The optional **Public market snapshot** in Tools downloads poe.ninja's public PoE 1 economy overview only after the user clicks refresh. It requests no account data, API key, OAuth token, or session cookie. Results are labelled as third-party estimates with their league/source/time, cached locally, included in backups, and never treated as guaranteed sale prices. Rare-item pricing is intentionally not guessed from incomplete local text.
 
+The copied-item explainer can show an exact-name snapshot for supported uniques or a base-type reference for rare items, but clearly refuses to present the base value as a rare-item valuation. Snapshot ages are warned at 12 hours and treated as stale at 48 hours.
+
 The build assessment and upgrade comparison deliberately use only values the app actually captured. They do not reproduce Path of Building's combat simulation, infer hidden passive effects, download current affix/price data, or claim exact DPS from incomplete screenshots. This keeps the no-login workflow private and makes uncertain data visible instead of fabricating precision.
 
 The progression review also checks captured gems for movement, guard, aura/reservation, and curse/mark coverage. These checks report only what has been captured; an absent result means “not observed,” not necessarily that the live character lacks it.
@@ -136,6 +142,8 @@ The progression review also checks captured gems for movement, guard, aura/reser
 Use **Settings → Backup and restore** to export a readable local JSON backup or merge one into the current installation. SQLite itself is compiled into the application, and the schema/database file is created automatically in the current user's private application-data directory. Existing working-directory databases are migrated on first launch. Settings also contains setup diagnostics, the exact database path, and any locally written panic log.
 
 Tagged releases and manually dispatched GitHub Actions build a Linux AppImage and a Windows NSIS installer with `cargo-packager`. Both packages carry an offline English Tesseract runtime/data set, and the workflow runs the complete test suite before packaging.
+
+Each release also publishes `SHA256SUMS.txt` so downloaded installers can be verified independently.
 
 Windows Authenticode signing is supported when repository secrets `WINDOWS_CERTIFICATE_BASE64` (base64 PFX contents) and `WINDOWS_CERTIFICATE_PASSWORD` are configured. Without them, the same workflow explicitly produces an unsigned installer. No signing material is stored in the repository.
 
