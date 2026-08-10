@@ -54,8 +54,11 @@ A native Windows/Linux Path of Exile companion written in Rust. The project is i
 - Resolution-specific OCR calibration presets with grayscale, contrast, and local text upscaling
 - Per-character map-risk profiles and editable Atlas/boss progression milestones
 - Versioned, user-supplied local PoE JSON data packs for modifier rules, passives, gems, maps, bosses, and pantheons
+- Bundled open core reference pack with optional user-supplied versioned overrides
 - Defensive coverage dashboard for captured armour/evasion, suppression, block, recovery, ailments, and resistances
+- Transparent captured defensive-readiness score with a visible 100-point breakdown and explicit non-simulation limits
 - Local candidate-item comparison against the captured equipped slot
+- Optional user-triggered poe.ninja market snapshots, cached locally by league with searchable currency/unique/gem/map estimates
 - Guided five-source Capture Center with persisted timestamps and OCR confidence per character
 - Custom percentage-based OCR crop calibration with a local image preview
 - Optional local passive-tree JSON loading to resolve allocated node IDs into names
@@ -119,6 +122,10 @@ Screenshot recognition uses Tesseract locally and never uploads images. Windows 
 Open **Tools** for the map-mod checker, crafting/upgrade worksheet, map-run journal, progression checklist, defensive coverage, and loot-filter editor. The map checker can capture the top-center of the game screen with the same local OCR pipeline used by character capture. Risk phrases are stored per character; craft notes, filters, progression, completed map runs, and trade history stay local.
 
 Settings can load an optional versioned local data-pack JSON or export a starter template. Packs are ordinary readable files, require no network access, and can supply modifier patterns, passive labels, gem tags, map/boss/pantheon lists, and crafting notes. Update checks are manual and read only the public GitHub release endpoint.
+
+The bundled core pack is used automatically when no override is selected. The defensive-readiness score is deliberately inspectable and based only on captured values; it is not effective hit pool, DPS, or a combat simulator. Candidate-item comparisons likewise show their simple defensive weights and do not score offence or special mechanics.
+
+The optional **Public market snapshot** in Tools downloads poe.ninja's public PoE 1 economy overview only after the user clicks refresh. It requests no account data, API key, OAuth token, or session cookie. Results are labelled as third-party estimates with their league/source/time, cached locally, included in backups, and never treated as guaranteed sale prices. Rare-item pricing is intentionally not guessed from incomplete local text.
 
 The build assessment and upgrade comparison deliberately use only values the app actually captured. They do not reproduce Path of Building's combat simulation, infer hidden passive effects, download current affix/price data, or claim exact DPS from incomplete screenshots. This keeps the no-login workflow private and makes uncertain data visible instead of fabricating precision.
 

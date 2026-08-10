@@ -1,0 +1,32 @@
+{
+  "format_version": 1,
+  "poe_version": "generic-poe1",
+  "label": "Exile Companion core reference v1",
+  "modifier_rules": [
+    { "label": "Maximum life", "pattern": "maximum life", "desirable_minimum": 70 },
+    { "label": "Fire resistance", "pattern": "fire resistance", "desirable_minimum": 30 },
+    { "label": "Cold resistance", "pattern": "cold resistance", "desirable_minimum": 30 },
+    { "label": "Lightning resistance", "pattern": "lightning resistance", "desirable_minimum": 30 },
+    { "label": "Chaos resistance", "pattern": "chaos resistance", "desirable_minimum": 20 },
+    { "label": "Movement speed", "pattern": "movement speed", "desirable_minimum": 25 }
+  ],
+  "gem_tags": {
+    "Dash": ["movement"],
+    "Flame Dash": ["movement"],
+    "Frostblink": ["movement"],
+    "Molten Shell": ["guard"],
+    "Steelskin": ["guard"],
+    "Immortal Call": ["guard"],
+    "Determination": ["aura", "reservation"],
+    "Grace": ["aura", "reservation"],
+    "Purity of Elements": ["aura", "reservation"]
+  },
+  "passive_nodes": {},
+  "maps": [],
+  "bosses": ["The Maven", "The Searing Exarch", "The Eater of Worlds", "The Shaper", "The Elder"],
+  "pantheons": ["Soul of Lunaris", "Soul of Solaris", "Soul of Arakaali", "Soul of Brine King"],
+  "crafting_notes": [
+    "Values are generic reference targets, not current-league guarantees.",
+    "Verify item level, influence, affix tiers, and open affix slots before spending currency."
+  ]
+}

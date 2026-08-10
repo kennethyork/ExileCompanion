@@ -33,6 +33,7 @@ before-packaging-command = "cargo build --release -p poe-app"
 binaries = [{ path = "poe-app", main = true }]
 resources = [
     { src = "bundle/ocr-runtime", target = "ocr-runtime" },
+    { src = "assets/core-data-pack.json", target = "core-data-pack.json" },
     { src = "THIRD_PARTY_NOTICES.md", target = "THIRD_PARTY_NOTICES.md" },
 ]
 

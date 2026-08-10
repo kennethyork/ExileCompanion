@@ -1,9 +1,9 @@
 use eframe::egui::{self, Color32, RichText, Stroke};
 use poe_ai::{ChatMessage, OllamaClient};
 use poe_character::{
-    assess_character, inspect_passive_tree_url, parse_character_identity_text,
-    parse_character_sheet_text, parse_gem_text, parse_item_text, CapturedItem,
-    DetectedCharacterIdentity, OfflineCharacter,
+    assess_character, defensive_readiness_score, inspect_passive_tree_url,
+    parse_character_identity_text, parse_character_sheet_text, parse_gem_text, parse_item_text,
+    CapturedItem, DetectedCharacterIdentity, OfflineCharacter,
 };
 use poe_core::{parse_trade_request, EventKind, GameEvent, SessionStats, TradeRequest};
 use poe_logs::{spawn_tail, LogUpdate};
@@ -226,6 +226,10 @@ struct BackupBundle {
     ocr_presets: BTreeMap<String, OcrCalibrationPreset>,
     #[serde(default)]
     local_data_pack_path: String,
+    #[serde(default)]
+    market_cache: MarketCache,
+    #[serde(default)]
+    market_league: String,
 }
 
 #[derive(Debug, Clone)]
@@ -291,6 +295,26 @@ struct ModifierRule {
 struct ReleaseInfo {
     tag: String,
     url: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+struct MarketCache {
+    format_version: u32,
+    source: String,
+    league: String,
+    fetched_at: String,
+    prices: Vec<MarketPrice>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+struct MarketPrice {
+    name: String,
+    category: String,
+    chaos_value: f64,
+    divine_value: Option<f64>,
+    listings: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -403,6 +427,11 @@ struct CompanionApp {
     setup_complete: bool,
     update_status: String,
     update_receiver: Option<Receiver<Result<ReleaseInfo, String>>>,
+    market_league: String,
+    market_query: String,
+    market_cache: MarketCache,
+    market_status: String,
+    market_receiver: Option<Receiver<Result<MarketCache, String>>>,
     backup_status: String,
     crash_log: String,
     crash_log_path: PathBuf,
@@ -493,8 +522,12 @@ impl CompanionApp {
                 .unwrap_or(2)
                 .clamp(1, 4),
         };
-        let ocr_presets =
-            serde_json::from_str(&stored_text(&store, "ocr.presets", "{}")).unwrap_or_default();
+        let mut ocr_presets = builtin_ocr_presets();
+        if let Ok(saved) = serde_json::from_str::<BTreeMap<String, OcrCalibrationPreset>>(
+            &stored_text(&store, "ocr.presets", "{}"),
+        ) {
+            ocr_presets.extend(saved);
+        }
         let diagnostics = initial_diagnostics(
             &guessed,
             store.is_some(),
@@ -515,13 +548,28 @@ impl CompanionApp {
             )
         };
         let local_data_pack_path = stored_text(&store, "data_pack.path", "");
-        let local_data_pack = load_local_data_pack_path(&local_data_pack_path).ok();
+        let local_data_pack = load_local_data_pack_path(&local_data_pack_path)
+            .ok()
+            .or_else(builtin_local_data_pack);
         let local_data_pack_status = local_data_pack.as_ref().map_or_else(
-            || "No versioned local data pack loaded".into(),
+            || "Core local data pack could not be loaded".into(),
             |pack| format!("{} · PoE {}", pack.label, pack.poe_version),
         );
         let trade_notifications = stored_bool(&store, "trade.notifications", true);
         let setup_complete = stored_bool(&store, "setup.complete", false);
+        let market_league = stored_text(&store, "market.league", "Standard");
+        let market_cache = load_market_cache().unwrap_or_default();
+        let market_status = if market_cache.prices.is_empty() {
+            "No public market snapshot cached; refresh manually when wanted".into()
+        } else {
+            format!(
+                "Cached {} prices for {} from {} · {}",
+                market_cache.prices.len(),
+                market_cache.league,
+                market_cache.fetched_at,
+                market_cache.source
+            )
+        };
         Self {
             page: Page::Dashboard,
             filter: EventFilter::All,
@@ -622,6 +670,11 @@ impl CompanionApp {
             setup_complete,
             update_status: "Update checks are manual and use the public GitHub release page".into(),
             update_receiver: None,
+            market_league,
+            market_query: String::new(),
+            market_cache,
+            market_status,
+            market_receiver: None,
             backup_status:
                 "Backups include characters, map runs, planner data, and capture settings".into(),
             crash_log: std::fs::read_to_string(&crash_log_path).unwrap_or_default(),
@@ -865,6 +918,8 @@ impl CompanionApp {
             ocr_preprocess: self.ocr_preprocess,
             ocr_presets: self.ocr_presets.clone(),
             local_data_pack_path: self.local_data_pack_path.clone(),
+            market_cache: self.market_cache.clone(),
+            market_league: self.market_league.clone(),
         };
         self.backup_status = match serde_json::to_string_pretty(&bundle)
             .map_err(|error| error.to_string())
@@ -924,9 +979,18 @@ impl CompanionApp {
         self.screenshot_watch_folder = bundle.screenshot_watch_folder;
         self.custom_ocr_crop = bundle.custom_crop.normalized();
         self.ocr_preprocess = bundle.ocr_preprocess;
-        self.ocr_presets = bundle.ocr_presets;
+        self.ocr_presets = builtin_ocr_presets();
+        self.ocr_presets.extend(bundle.ocr_presets);
         self.local_data_pack_path = bundle.local_data_pack_path;
-        self.local_data_pack = load_local_data_pack_path(&self.local_data_pack_path).ok();
+        self.local_data_pack = load_local_data_pack_path(&self.local_data_pack_path)
+            .ok()
+            .or_else(builtin_local_data_pack);
+        self.market_cache = bundle.market_cache;
+        self.market_league = if bundle.market_league.trim().is_empty() {
+            "Standard".into()
+        } else {
+            bundle.market_league
+        };
 
         if let Some(store) = &self.store {
             for character in &self.characters {
@@ -960,7 +1024,9 @@ impl CompanionApp {
             self.map_runs = store.map_runs(10_000).unwrap_or_default();
             self.trade_history = store.trade_history(250).unwrap_or_default();
             let _ = store.set_preference("data_pack.path", &self.local_data_pack_path);
+            let _ = store.set_preference("market.league", &self.market_league);
         }
+        let _ = save_market_cache(&self.market_cache);
         self.save_custom_crop();
         self.backup_status = format!("Restored and merged backup from {}", path.display());
     }
@@ -1035,6 +1101,52 @@ impl CompanionApp {
                 Err(error) => format!("Update check failed: {error}"),
             };
             self.update_receiver = None;
+        }
+    }
+
+    fn refresh_market_snapshot(&mut self) {
+        if self.market_receiver.is_some() {
+            return;
+        }
+        let league = self.market_league.trim().to_string();
+        if league.is_empty() {
+            self.market_status = "Enter a league name such as Standard".into();
+            return;
+        }
+        if let Some(store) = &self.store {
+            let _ = store.set_preference("market.league", &league);
+        }
+        self.market_status = format!("Downloading a public {league} market snapshot…");
+        let (sender, receiver) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = sender.send(fetch_public_market_snapshot(&league));
+        });
+        self.market_receiver = Some(receiver);
+    }
+
+    fn collect_market_snapshot(&mut self) {
+        let Some(receiver) = &self.market_receiver else {
+            return;
+        };
+        if let Ok(result) = receiver.try_recv() {
+            match result {
+                Ok(cache) => {
+                    self.market_status = format!(
+                        "Cached {} public prices for {} · {} · {}",
+                        cache.prices.len(),
+                        cache.league,
+                        cache.fetched_at,
+                        cache.source
+                    );
+                    if let Err(error) = save_market_cache(&cache) {
+                        self.market_status
+                            .push_str(&format!(" · cache warning: {error}"));
+                    }
+                    self.market_cache = cache;
+                }
+                Err(error) => self.market_status = format!("Market refresh failed: {error}"),
+            }
+            self.market_receiver = None;
         }
     }
 
@@ -1227,7 +1339,16 @@ impl CompanionApp {
 
     fn capture_gem(&mut self) {
         match parse_gem_text(&self.gem_group, &self.gem_input) {
-            Ok(gem) => {
+            Ok(mut gem) => {
+                if let Some(tags) = self
+                    .local_data_pack
+                    .as_ref()
+                    .and_then(|pack| pack.gem_tags.get(&gem.name))
+                {
+                    gem.tags.extend(tags.iter().cloned());
+                    gem.tags.sort();
+                    gem.tags.dedup();
+                }
                 let name = gem.name.clone();
                 self.offline_character.gems.retain(|existing| {
                     !(existing.group.eq_ignore_ascii_case(&gem.group)
@@ -1415,12 +1536,17 @@ impl CompanionApp {
         }
         self.ocr_status = format!("Reading {} locally…", path.display());
         let region = self.capture_region;
-        let (custom_crop, preprocess) = image::image_dimensions(&path)
-            .ok()
-            .and_then(|(width, height)| self.ocr_presets.get(&format!("{width}x{height}")))
-            .map_or((self.custom_ocr_crop, self.ocr_preprocess), |preset| {
-                (preset.crop, preset.preprocess)
-            });
+        let (custom_crop, preprocess) = image::image_dimensions(&path).map_or(
+            (self.custom_ocr_crop, self.ocr_preprocess),
+            |dimensions| {
+                ocr_settings_for_dimensions(
+                    &self.ocr_presets,
+                    dimensions,
+                    self.custom_ocr_crop,
+                    self.ocr_preprocess,
+                )
+            },
+        );
         let (sender, receiver) = mpsc::channel();
         std::thread::spawn(move || {
             let result = run_tesseract(&path, region, custom_crop, preprocess);
@@ -1450,12 +1576,12 @@ impl CompanionApp {
         std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_millis(650));
             let result = capture_current_screen(&path).and_then(|()| {
-                let (crop, preprocessing) = image::image_dimensions(&path)
-                    .ok()
-                    .and_then(|(width, height)| presets.get(&format!("{width}x{height}")))
-                    .map_or((custom_crop, preprocess), |preset| {
-                        (preset.crop, preset.preprocess)
-                    });
+                let (crop, preprocessing) = image::image_dimensions(&path).map_or(
+                    (custom_crop, preprocess),
+                    |dimensions| {
+                        ocr_settings_for_dimensions(&presets, dimensions, custom_crop, preprocess)
+                    },
+                );
                 run_tesseract(&path, region, crop, preprocessing)
             });
             let _ = std::fs::remove_file(&path);
@@ -2071,6 +2197,18 @@ impl CompanionApp {
                 "User-captured offline character snapshot:\n{}",
                 self.offline_character.summary()
             ));
+            let readiness = defensive_readiness_score(&self.offline_character);
+            sections.push(format!(
+                "Transparent captured defensive-readiness indicator (not EHP or simulation): {}/{}\n{}",
+                readiness.score,
+                readiness.maximum,
+                readiness
+                    .breakdown
+                    .iter()
+                    .map(|(label, score, maximum)| format!("{label}: {score}/{maximum}"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            ));
         } else {
             sections.push("No offline character snapshot has been captured.".into());
         }
@@ -2078,6 +2216,36 @@ impl CompanionApp {
             sections.push(format!(
                 "Optional user-imported Path of Building snapshot:\n{}",
                 build.summary()
+            ));
+        }
+        if let Some(pack) = &self.local_data_pack {
+            sections.push(format!(
+                "Loaded local reference pack: {} · PoE label {} · format {}",
+                pack.label, pack.poe_version, pack.format_version
+            ));
+        }
+        let market_matches = self
+            .offline_character
+            .items
+            .iter()
+            .filter_map(|item| {
+                self.market_cache
+                    .prices
+                    .iter()
+                    .find(|price| {
+                        price.name.eq_ignore_ascii_case(&item.name)
+                            || price.name.eq_ignore_ascii_case(&item.base_type)
+                    })
+                    .map(|price| format!("{}: {:.2} chaos", item.name, price.chaos_value))
+            })
+            .collect::<Vec<_>>();
+        if !market_matches.is_empty() {
+            sections.push(format!(
+                "Third-party public market snapshot (estimate only): {} · {} · {}\n{}",
+                self.market_cache.source,
+                self.market_cache.league,
+                self.market_cache.fetched_at,
+                market_matches.join("\n")
             ));
         }
         sections.join("\n\n")
@@ -2747,6 +2915,10 @@ impl CompanionApp {
                 ui.separator();
                 let mut remove_index = None;
                 for (index, item) in self.offline_character.items.iter().enumerate() {
+                    let market_estimate = self.market_cache.prices.iter().find(|price| {
+                        price.name.eq_ignore_ascii_case(&item.name)
+                            || price.name.eq_ignore_ascii_case(&item.base_type)
+                    });
                     ui.horizontal(|ui| {
                         ui.label(RichText::new(&item.slot).color(GOLD).strong());
                         ui.label(format!("{} · {}", item.name, item.base_type));
@@ -2755,6 +2927,13 @@ impl CompanionApp {
                                 remove_index = Some(index);
                             }
                             ui.label(RichText::new(&item.rarity).size(10.0).color(TEXT_MUTED));
+                            if let Some(price) = market_estimate {
+                                ui.label(
+                                    RichText::new(format!("~{:.1}c snapshot", price.chaos_value))
+                                        .size(10.0)
+                                        .color(SUCCESS),
+                                );
+                            }
                         });
                     });
                 }
@@ -3889,6 +4068,8 @@ impl CompanionApp {
                 }
 
                 ui.add_space(14.0);
+                self.market_tool(ui);
+                ui.add_space(14.0);
                 self.loot_filter_tool(ui);
                 ui.add_space(18.0);
             });
@@ -4004,6 +4185,7 @@ impl CompanionApp {
             });
             if !self.item_comparison.is_empty() {
                 ui.label(RichText::new(&self.item_comparison).color(GOLD));
+                ui.label(RichText::new("Index weights: 10 life/ES, 100 armour/evasion, 3% elemental resistance, or 2% chaos resistance each contribute one point. Offence and special mechanics are not scored.").size(10.0).color(TEXT_MUTED));
             }
             ui.add(
                 egui::TextEdit::multiline(&mut self.crafting_plan)
@@ -4149,6 +4331,21 @@ impl CompanionApp {
             ui.separator();
             ui.label(RichText::new("DEFENSIVE COVERAGE").size(10.0).color(GOLD));
             ui.label(captured_defense_summary(&self.offline_character));
+            let readiness = defensive_readiness_score(&self.offline_character);
+            ui.add(
+                egui::ProgressBar::new(readiness.score as f32 / readiness.maximum as f32).text(
+                    format!(
+                        "Captured defensive readiness: {}/{}",
+                        readiness.score, readiness.maximum
+                    ),
+                ),
+            );
+            egui::CollapsingHeader::new("Score breakdown and limits").show(ui, |ui| {
+                for (label, score, maximum) in &readiness.breakdown {
+                    ui.label(format!("{score:>2}/{maximum:<2} · {label}"));
+                }
+                ui.label(RichText::new("This score uses only visible captured fields. It is not EHP, DPS, survivability probability, or a substitute for Path of Building.").size(10.0).color(GOLD_DIM));
+            });
             let assessment = assess_character(&self.offline_character);
             for (label, covered) in &assessment.coverage {
                 ui.colored_label(
@@ -4194,6 +4391,84 @@ impl CompanionApp {
                 }
             });
             ui.label(RichText::new(&self.loot_filter_status).color(TEXT_MUTED));
+        });
+    }
+
+    fn market_tool(&mut self, ui: &mut egui::Ui) {
+        planner_frame(ui, "PUBLIC MARKET SNAPSHOT", |ui| {
+            ui.label("Optional poe.ninja estimates. Refresh only when clicked; the result is cached locally and requires no account or API key.");
+            ui.horizontal_wrapped(|ui| {
+                ui.label("League");
+                ui.text_edit_singleline(&mut self.market_league);
+                if ui
+                    .add_enabled(
+                        self.market_receiver.is_none(),
+                        egui::Button::new("Refresh public snapshot"),
+                    )
+                    .clicked()
+                {
+                    self.refresh_market_snapshot();
+                }
+                if self.market_receiver.is_some() {
+                    ui.spinner();
+                }
+            });
+            ui.label(
+                RichText::new(&self.market_status)
+                    .size(11.0)
+                    .color(TEXT_MUTED),
+            );
+            ui.add(
+                egui::TextEdit::singleline(&mut self.market_query)
+                    .hint_text("Search currency, unique, gem, map…")
+                    .desired_width(f32::INFINITY),
+            );
+            let query = self.market_query.trim().to_ascii_lowercase();
+            let matches = self
+                .market_cache
+                .prices
+                .iter()
+                .filter(|price| {
+                    query.is_empty()
+                        || price.name.to_ascii_lowercase().contains(&query)
+                        || price.category.to_ascii_lowercase().contains(&query)
+                })
+                .take(40)
+                .collect::<Vec<_>>();
+            egui::ScrollArea::vertical()
+                .max_height(240.0)
+                .show(ui, |ui| {
+                    for price in matches {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(RichText::new(&price.name).strong());
+                            ui.label(RichText::new(&price.category).size(10.0).color(TEXT_MUTED));
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    ui.colored_label(
+                                        GOLD,
+                                        format!("{:.2} chaos", price.chaos_value),
+                                    );
+                                    if let Some(divine) =
+                                        price.divine_value.filter(|value| *value > 0.0)
+                                    {
+                                        ui.label(format!("{divine:.3} divine"));
+                                    }
+                                    if let Some(listings) = price.listings {
+                                        ui.label(format!("{listings} listings"));
+                                    }
+                                },
+                            );
+                        });
+                    }
+                    if self.market_cache.prices.is_empty() {
+                        ui.label(
+                            RichText::new("Refresh to create the first local snapshot.")
+                                .color(TEXT_MUTED),
+                        );
+                    }
+                });
+            ui.label(RichText::new("Estimates are third-party snapshots, not exact rare-item valuations or guaranteed sale prices.").size(10.0).color(GOLD_DIM));
         });
     }
 
@@ -4265,6 +4540,15 @@ impl CompanionApp {
                 ui.horizontal_wrapped(|ui| {
                     if ui.button("Load data pack…").clicked() { self.choose_local_data_pack(); }
                     if ui.button("Export starter template…").clicked() { self.export_local_data_pack_template(); }
+                    if ui.button("Use bundled core pack").clicked() {
+                        self.local_data_pack_path.clear();
+                        self.local_data_pack = builtin_local_data_pack();
+                        self.local_data_pack_status = self.local_data_pack.as_ref().map_or_else(
+                            || "Core local data pack could not be loaded".into(),
+                            |pack| format!("{} · PoE {}", pack.label, pack.poe_version),
+                        );
+                        if let Some(store) = &self.store { let _ = store.set_preference("data_pack.path", ""); }
+                    }
                 });
                 ui.label(RichText::new(&self.local_data_pack_status).color(TEXT_MUTED));
                 if let Some(pack) = &self.local_data_pack {
@@ -4456,6 +4740,7 @@ impl eframe::App for CompanionApp {
         self.collect_ai();
         self.collect_ocr(ctx);
         self.collect_update_check();
+        self.collect_market_snapshot();
         self.poll_screenshot_folder();
         ctx.request_repaint_after(std::time::Duration::from_millis(250));
         if self.overlay_mode && self.compact_mode {
@@ -4654,6 +4939,19 @@ fn crop_ocr_region(
     processed
         .save(target)
         .map_err(|error| format!("Could not prepare OCR region: {error}"))
+}
+
+fn ocr_settings_for_dimensions(
+    presets: &BTreeMap<String, OcrCalibrationPreset>,
+    (width, height): (u32, u32),
+    fallback_crop: OcrCrop,
+    fallback_preprocess: OcrPreprocess,
+) -> (OcrCrop, OcrPreprocess) {
+    presets
+        .get(&format!("{width}x{height}"))
+        .map_or((fallback_crop, fallback_preprocess), |preset| {
+            (preset.crop, preset.preprocess)
+        })
 }
 
 fn load_image_preview(path: &std::path::Path) -> Result<egui::ColorImage, String> {
@@ -4986,6 +5284,204 @@ fn database_path() -> PathBuf {
 
 fn crash_log_path() -> PathBuf {
     app_data_directory().join(CRASH_LOG_FILE)
+}
+
+fn market_cache_path() -> PathBuf {
+    app_data_directory().join("market-cache.json")
+}
+
+fn builtin_local_data_pack() -> Option<LocalDataPack> {
+    serde_json::from_str(include_str!("../assets/core-data-pack.json")).ok()
+}
+
+fn builtin_ocr_presets() -> BTreeMap<String, OcrCalibrationPreset> {
+    [
+        ("1920x1080", 2_u32),
+        ("2560x1440", 2_u32),
+        ("3440x1440", 2_u32),
+        ("3840x2160", 1_u32),
+    ]
+    .into_iter()
+    .map(|(resolution, scale)| {
+        (
+            resolution.into(),
+            OcrCalibrationPreset {
+                crop: OcrCrop::default(),
+                preprocess: OcrPreprocess {
+                    grayscale: true,
+                    contrast: 24.0,
+                    scale,
+                },
+            },
+        )
+    })
+    .collect()
+}
+
+fn load_market_cache() -> Result<MarketCache, String> {
+    let path = market_cache_path();
+    let text = std::fs::read_to_string(&path)
+        .map_err(|error| format!("Could not read {}: {error}", path.display()))?;
+    let cache = serde_json::from_str::<MarketCache>(&text)
+        .map_err(|error| format!("Invalid market cache: {error}"))?;
+    if cache.format_version != 1 {
+        return Err(format!(
+            "Unsupported market cache format {}",
+            cache.format_version
+        ));
+    }
+    Ok(cache)
+}
+
+fn save_market_cache(cache: &MarketCache) -> Result<(), String> {
+    let path = market_cache_path();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|error| format!("Could not create cache directory: {error}"))?;
+    }
+    let data = serde_json::to_string_pretty(cache).map_err(|error| error.to_string())?;
+    std::fs::write(&path, data)
+        .map_err(|error| format!("Could not write {}: {error}", path.display()))
+}
+
+fn fetch_public_market_snapshot(league: &str) -> Result<MarketCache, String> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(20))
+        .build()
+        .map_err(|error| error.to_string())?;
+    let mut prices = Vec::new();
+    let mut errors = Vec::new();
+    for category in ["Currency", "Fragment"] {
+        if let Err(error) = fetch_market_category(
+            &client,
+            "https://poe.ninja/poe1/api/economy/stash/current/currency/overview",
+            league,
+            category,
+            true,
+            &mut prices,
+        ) {
+            errors.push(error);
+        }
+    }
+    for category in [
+        "UniqueWeapon",
+        "UniqueArmour",
+        "UniqueAccessory",
+        "UniqueJewel",
+        "UniqueFlask",
+        "SkillGem",
+        "Map",
+    ] {
+        if let Err(error) = fetch_market_category(
+            &client,
+            "https://poe.ninja/poe1/api/economy/stash/current/item/overview",
+            league,
+            category,
+            false,
+            &mut prices,
+        ) {
+            errors.push(error);
+        }
+    }
+    if prices.is_empty() {
+        return Err(format!(
+            "The public source returned no prices; verify the league name{}",
+            if errors.is_empty() {
+                String::new()
+            } else {
+                format!(": {}", errors.join("; "))
+            }
+        ));
+    }
+    prices.sort_by(|left, right| {
+        left.name
+            .to_ascii_lowercase()
+            .cmp(&right.name.to_ascii_lowercase())
+            .then_with(|| left.category.cmp(&right.category))
+    });
+    Ok(MarketCache {
+        format_version: 1,
+        source: if errors.is_empty() {
+            "poe.ninja public economy snapshot".into()
+        } else {
+            format!(
+                "poe.ninja partial snapshot · skipped {} categories",
+                errors.len()
+            )
+        },
+        league: league.into(),
+        fetched_at: chrono::Utc::now().to_rfc3339(),
+        prices,
+    })
+}
+
+fn fetch_market_category(
+    client: &reqwest::blocking::Client,
+    url: &str,
+    league: &str,
+    category: &str,
+    currency: bool,
+    prices: &mut Vec<MarketPrice>,
+) -> Result<(), String> {
+    let value = client
+        .get(url)
+        .query(&[("league", league), ("type", category)])
+        .header(
+            reqwest::header::USER_AGENT,
+            "ExileCompanion/market-snapshot",
+        )
+        .send()
+        .and_then(reqwest::blocking::Response::error_for_status)
+        .map_err(|error| format!("{category}: {error}"))?
+        .json::<serde_json::Value>()
+        .map_err(|error| format!("{category}: invalid response: {error}"))?;
+    parse_market_lines(&value, category, currency, prices);
+    Ok(())
+}
+
+fn parse_market_lines(
+    value: &serde_json::Value,
+    category: &str,
+    currency: bool,
+    prices: &mut Vec<MarketPrice>,
+) {
+    let Some(lines) = value.get("lines").and_then(serde_json::Value::as_array) else {
+        return;
+    };
+    for line in lines {
+        let name = line
+            .get(if currency { "currencyTypeName" } else { "name" })
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .trim();
+        let chaos_value = line
+            .get(if currency {
+                "chaosEquivalent"
+            } else {
+                "chaosValue"
+            })
+            .and_then(serde_json::Value::as_f64)
+            .unwrap_or_default();
+        if name.is_empty() || !chaos_value.is_finite() || chaos_value <= 0.0 {
+            continue;
+        }
+        let listings = line
+            .get("listingCount")
+            .or_else(|| line.get("count"))
+            .and_then(serde_json::Value::as_u64)
+            .or_else(|| {
+                line.get("pay")
+                    .and_then(|pay| pay.get("listing_count"))
+                    .and_then(serde_json::Value::as_u64)
+            });
+        prices.push(MarketPrice {
+            name: name.into(),
+            category: category.into(),
+            chaos_value,
+            divine_value: line.get("divineValue").and_then(serde_json::Value::as_f64),
+            listings,
+        });
+    }
 }
 
 fn migrate_legacy_database(
@@ -5408,19 +5904,34 @@ fn compare_captured_items(previous: &CapturedItem, current: &CapturedItem) -> St
     .filter(|(_, change)| *change != 0)
     .map(|(label, change)| format!("{label} {change:+}"))
     .collect::<Vec<_>>();
+    let old_index = captured_defense_contribution_index(previous);
+    let new_index = captured_defense_contribution_index(current);
+    let index_change = new_index - old_index;
     if changes.is_empty() {
         format!(
-            "{} → {} · no recognized stat change",
-            previous.name, current.name
+            "{} → {} · no recognized stat change · captured-defense index {old_index} → {new_index}",
+            previous.name, current.name,
         )
     } else {
         format!(
-            "{} → {} · {}",
+            "{} → {} · {} · captured-defense index {old_index} → {new_index} ({index_change:+})",
             previous.name,
             current.name,
             changes.join(" · ")
         )
     }
+}
+
+fn captured_defense_contribution_index(item: &CapturedItem) -> i32 {
+    let bonuses = &item.bonuses;
+    bonuses.life / 10
+        + bonuses.energy_shield / 10
+        + bonuses.armour / 100
+        + bonuses.evasion / 100
+        + bonuses.fire_resistance / 3
+        + bonuses.cold_resistance / 3
+        + bonuses.lightning_resistance / 3
+        + bonuses.chaos_resistance / 2
 }
 
 fn character_capture_freshness(captured: Option<std::time::Instant>) -> String {
@@ -6003,10 +6514,90 @@ mod tests {
             ocr_preprocess: OcrPreprocess::default(),
             ocr_presets: BTreeMap::new(),
             local_data_pack_path: String::new(),
+            market_cache: MarketCache::default(),
+            market_league: "Standard".into(),
         };
         let json = serde_json::to_string(&backup).unwrap();
         let restored: BackupBundle = serde_json::from_str(&json).unwrap();
         assert_eq!(restored.format_version, 1);
         assert_eq!(restored.map_risk_rules, "reflect");
+    }
+
+    #[test]
+    fn applies_resolution_specific_ocr_settings() {
+        assert!(builtin_ocr_presets().contains_key("3440x1440"));
+        let fallback_crop = OcrCrop::default();
+        let fallback_preprocess = OcrPreprocess::default();
+        let expected = OcrCalibrationPreset {
+            crop: OcrCrop {
+                left: 0.1,
+                top: 0.2,
+                width: 0.7,
+                height: 0.6,
+            },
+            preprocess: OcrPreprocess {
+                grayscale: false,
+                contrast: 41.0,
+                scale: 3,
+            },
+        };
+        let presets = BTreeMap::from([("2560x1440".into(), expected)]);
+        assert_eq!(
+            ocr_settings_for_dimensions(&presets, (2560, 1440), fallback_crop, fallback_preprocess),
+            (expected.crop, expected.preprocess)
+        );
+        assert_eq!(
+            ocr_settings_for_dimensions(&presets, (1920, 1080), fallback_crop, fallback_preprocess),
+            (fallback_crop, fallback_preprocess)
+        );
+    }
+
+    #[test]
+    fn preprocesses_and_scales_an_ocr_fixture() {
+        use image::GenericImageView;
+        let source = std::env::temp_dir().join(format!("ocr-source-{}.png", new_profile_id()));
+        let target = std::env::temp_dir().join(format!("ocr-target-{}.png", new_profile_id()));
+        image::DynamicImage::new_rgb8(100, 80)
+            .save(&source)
+            .unwrap();
+        crop_ocr_region(
+            &source,
+            &target,
+            CaptureRegion::Custom,
+            OcrCrop {
+                left: 0.25,
+                top: 0.25,
+                width: 0.5,
+                height: 0.5,
+            },
+            OcrPreprocess {
+                grayscale: true,
+                contrast: 30.0,
+                scale: 2,
+            },
+        )
+        .unwrap();
+        assert_eq!(image::open(&target).unwrap().dimensions(), (100, 80));
+        let _ = std::fs::remove_file(source);
+        let _ = std::fs::remove_file(target);
+    }
+
+    #[test]
+    fn parses_public_market_fixture_and_builtin_pack() {
+        let fixture = serde_json::json!({
+            "lines": [{
+                "currencyTypeName": "Divine Orb",
+                "chaosEquivalent": 152.5,
+                "pay": { "listing_count": 123 }
+            }]
+        });
+        let mut prices = Vec::new();
+        parse_market_lines(&fixture, "Currency", true, &mut prices);
+        assert_eq!(prices.len(), 1);
+        assert_eq!(prices[0].name, "Divine Orb");
+        assert_eq!(prices[0].listings, Some(123));
+        let pack = builtin_local_data_pack().unwrap();
+        assert_eq!(pack.format_version, 1);
+        assert!(!pack.modifier_rules.is_empty());
     }
 }

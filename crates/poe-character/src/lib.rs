@@ -180,6 +180,14 @@ pub struct LocalBuildAssessment {
     pub coverage: Vec<(String, bool)>,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DefensiveReadinessScore {
+    pub score: u32,
+    pub maximum: u32,
+    pub breakdown: Vec<(String, u32, u32)>,
+    pub captured_fields: usize,
+}
+
 pub fn parse_item_text(slot: &str, input: &str) -> Result<CapturedItem> {
     let text = input.trim();
     if text.is_empty() {
@@ -404,6 +412,85 @@ pub fn assess_character(character: &OfflineCharacter) -> LocalBuildAssessment {
         warnings,
         gem_groups,
         coverage,
+    }
+}
+
+/// Scores only explicitly captured defensive sheet values. This is a transparent
+/// readiness indicator, not an effective-hit-pool or combat simulation.
+pub fn defensive_readiness_score(character: &OfflineCharacter) -> DefensiveReadinessScore {
+    let capped = |name: &str, target: i32, weight: u32| {
+        let value = sheet_number(character, name).unwrap_or_default().max(0);
+        ((value.min(target) as f64 / target as f64) * weight as f64).round() as u32
+    };
+    let life_pool = sheet_number(character, "Life").unwrap_or_default().max(0)
+        + sheet_number(character, "Energy Shield")
+            .unwrap_or_default()
+            .max(0);
+    let elemental = ["Fire Resistance", "Cold Resistance", "Lightning Resistance"]
+        .iter()
+        .map(|name| capped(name, 75, 5))
+        .sum::<u32>();
+    let block = capped("Attack Block Chance", 75, 5) + capped("Spell Block Chance", 75, 5);
+    let gem_coverage = assess_character(character)
+        .coverage
+        .iter()
+        .filter(|(label, ready)| {
+            *ready
+                && matches!(
+                    label.as_str(),
+                    "Movement skill" | "Guard skill" | "Aura or reservation skill"
+                )
+        })
+        .count()
+        .min(3) as u32;
+    let breakdown = vec![
+        (
+            "Life + energy shield (target 5,000)".into(),
+            ((life_pool.min(5_000) as f64 / 5_000.0) * 25.0).round() as u32,
+            25,
+        ),
+        (
+            "Elemental resistances (target 75% each)".into(),
+            elemental,
+            15,
+        ),
+        (
+            "Chaos resistance (target 75%)".into(),
+            capped("Chaos Resistance", 75, 10),
+            10,
+        ),
+        (
+            "Spell suppression (target 100%)".into(),
+            capped("Spell Suppression Chance", 100, 15),
+            15,
+        ),
+        ("Attack + spell block (target 75% each)".into(), block, 10),
+        (
+            "Physical reduction (target 90%)".into(),
+            capped("Physical Damage Reduction", 90, 10),
+            10,
+        ),
+        (
+            "Elemental ailment avoidance (target 100%)".into(),
+            capped("Elemental Ailment Avoidance", 100, 5),
+            5,
+        ),
+        (
+            "Life regeneration (reference 500/s)".into(),
+            capped("Life Regeneration", 500, 5),
+            5,
+        ),
+        (
+            "Captured movement/guard/aura coverage".into(),
+            ((gem_coverage as f64 / 3.0) * 5.0).round() as u32,
+            5,
+        ),
+    ];
+    DefensiveReadinessScore {
+        score: breakdown.iter().map(|(_, score, _)| score).sum(),
+        maximum: 100,
+        breakdown,
+        captured_fields: character.sheet_stats.len(),
     }
 }
 
@@ -735,6 +822,31 @@ mod tests {
         assert_eq!(stats["Life"], "4,123");
         assert_eq!(stats["Fire Resistance"], "75%");
         assert_eq!(stats["Energy Shield"], "820");
+    }
+
+    #[test]
+    fn defensive_readiness_is_bounded_and_transparent() {
+        let mut character = OfflineCharacter::default();
+        for (name, value) in [
+            ("Life", "5,000"),
+            ("Fire Resistance", "75%"),
+            ("Cold Resistance", "75%"),
+            ("Lightning Resistance", "75%"),
+            ("Chaos Resistance", "75%"),
+            ("Spell Suppression Chance", "100%"),
+            ("Attack Block Chance", "75%"),
+            ("Spell Block Chance", "75%"),
+            ("Physical Damage Reduction", "90%"),
+            ("Elemental Ailment Avoidance", "100%"),
+            ("Life Regeneration", "500"),
+        ] {
+            character.sheet_stats.insert(name.into(), value.into());
+        }
+        let score = defensive_readiness_score(&character);
+        assert!(score.score <= score.maximum);
+        assert_eq!(score.maximum, 100);
+        assert_eq!(score.breakdown.len(), 9);
+        assert!(score.score >= 90);
     }
 
     #[test]
