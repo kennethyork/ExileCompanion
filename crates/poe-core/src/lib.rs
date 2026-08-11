@@ -63,10 +63,6 @@ pub fn parse_client_line(line: &str) -> Option<GameEvent> {
     let message = message.strip_prefix(": ").unwrap_or(message);
     let (kind, useful) = if let Some(area) = message.strip_prefix("You have entered ") {
         (EventKind::AreaEntered, area.trim_end_matches('.'))
-    } else if message.contains("has died") || message.contains("You have died") {
-        (EventKind::Death, message)
-    } else if message.contains("is now level") || message.contains("You have reached level") {
-        (EventKind::LevelUp, message)
     } else if message.contains("Hi, I would like to buy your")
         || message.contains("Hi, I'd like to buy your")
     {
@@ -79,12 +75,23 @@ pub fn parse_client_line(line: &str) -> Option<GameEvent> {
         || message.starts_with('$')
     {
         (EventKind::Chat, message)
+    } else if is_death_message(message) {
+        (EventKind::Death, message)
+    } else if message.contains("is now level") || message.contains("You have reached level") {
+        (EventKind::LevelUp, message)
     } else if message.contains("Connected to ") || message.contains("Closing game gracefully") {
         (EventKind::System, message)
     } else {
         return None;
     };
     Some(GameEvent::new(kind, useful))
+}
+
+fn is_death_message(message: &str) -> bool {
+    let message = message.trim_end_matches(['.', '!']);
+    message == "You have died"
+        || message.ends_with(" has died")
+        || message.ends_with(" has been slain")
 }
 
 pub fn parse_trade_request(message: &str) -> Option<TradeRequest> {
@@ -142,6 +149,32 @@ mod tests {
         .unwrap();
         assert_eq!(event.kind, EventKind::AreaEntered);
         assert_eq!(event.message, "The Twilight Strand");
+    }
+
+    #[test]
+    fn parses_real_client_death_format() {
+        let event = parse_client_line(
+            "2026/08/08 23:31:33 1 abcd [INFO Client 332] : ExampleCharacter has been slain.",
+        )
+        .unwrap();
+        assert_eq!(event.kind, EventKind::Death);
+    }
+
+    #[test]
+    fn parses_you_have_died_format() {
+        let event =
+            parse_client_line("2026/08/08 23:31:33 1 abcd [INFO Client 332] : You have died.")
+                .unwrap();
+        assert_eq!(event.kind, EventKind::Death);
+    }
+
+    #[test]
+    fn does_not_count_chat_quoting_a_death_message() {
+        let event = parse_client_line(
+            "2026/08/08 23:31:33 1 abcd [INFO Client 332] #Player: You have died.",
+        )
+        .unwrap();
+        assert_eq!(event.kind, EventKind::Chat);
     }
 
     #[test]
